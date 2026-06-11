@@ -600,6 +600,7 @@ class BugHunterPro:
                     payloads=self.usb_payloads,
                     wifi_recon=self.usb_wifi,
                     agent_recon=self.usb_agent,
+                    authorized=True,
                 )
             except ImportError:
                 warn("usb_attack.py not found — USB module skipped")
