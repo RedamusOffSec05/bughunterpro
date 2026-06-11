@@ -1,24 +1,23 @@
-﻿# BugHunterPro 🎯
+﻿# BugHunterPro
 
-**Automated Bug Bounty Hunting Framework**
+Automated Bug Bounty Hunting Framework
 
-Un framework modular para automatizar reconocimiento, escaneo de vulnerabilidades y generación de reportes en bug bounty hunting.
+## Features
 
-## 🚀 Características
+- Subdomain enumeration
+- Port scanning
+- Vulnerability detection (SQL Injection, XSS, IDOR)
+- Automated reporting (JSON + Markdown)
+- Multiple scanning modes (Normal / Aggressive)
+- Detailed logging
 
-✅ Enumeración de Subdominios
-✅ Escaneo de Puertos  
-✅ Detección de Vulnerabilidades (SQLi, XSS, IDOR)
-✅ Generación de Reportes (JSON + Markdown)
-✅ Modos de Escaneo (Normal / Aggressive)
-
-## 📋 Requisitos
+## Requirements
 
 - Python 3.8+
 - nmap
 - pip
 
-## 🔧 Instalación
+## Installation
 
 \\\ash
 git clone https://github.com/RedamusOffSec05/bughunterpro.git
@@ -26,52 +25,57 @@ cd bughunterpro
 pip install -r requirements.txt
 \\\
 
-## 💻 Uso
+## Usage
 
+Basic scan:
 \\\ash
-# Modo normal
 python BugHunterPro.py --target example.com
+\\\
 
-# Modo agresivo
+Aggressive scan:
+\\\ash
 python BugHunterPro.py --target example.com --mode aggressive
 \\\
 
-## 📊 Reportes
+## Reports
 
-Genera reportes automáticos en JSON y Markdown con:
-- Lista de subdominios encontrados
-- Vulnerabilidades detectadas
-- Puntuaciones CVSS
-- Recomendaciones
+Generates automatic reports in JSON and Markdown format with:
+- List of discovered subdomains
+- Detected vulnerabilities
+- CVSS scores
+- Recommendations
 
-## 🛡️ Consideraciones Legales
+## Legal Notice
 
-⚠️ **IMPORTANTE:** Solo usar en targets autorizados
+IMPORTANT: Only use on authorized targets
 
-- Respetar términos de bug bounty programs
-- Verificar scope antes de escanear
-- Usar responsablemente
+- Respect bug bounty program terms
+- Verify scope before scanning
+- Use responsibly and ethically
 
-### Programas de Bug Bounty
-- [HackerOne](https://www.hackerone.com)
-- [Bugcrowd](https://www.bugcrowd.com)
-- [Intigriti](https://www.intigriti.com)
+## Supported Bug Bounty Platforms
 
-## 🤝 Contribuciones
+- HackerOne (https://www.hackerone.com)
+- Bugcrowd (https://www.bugcrowd.com)
+- Intigriti (https://www.intigriti.com)
+- YesWeHack (https://www.yeswehack.com)
 
-Las contribuciones son bienvenidas. Fork, crea una rama y envía un Pull Request.
+## Contributing
 
-## 📄 Licencia
+Contributions are welcome. Please:
+1. Fork the repository
+2. Create a feature branch
+3. Submit a pull request
 
-MIT License - Ver LICENSE para detalles
+## License
 
-## 👤 Autor
+MIT License - See LICENSE file for details
 
-**Steven (RedOffSec05)**
+## Author
+
+Steven (RedOffSec05)
 - Security Researcher
 - Bug Bounty Hunter
 - Cybersecurity Consultant
 
----
-
-**Happy Hunting! 🎯**
+Happy Hunting!
