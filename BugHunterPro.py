@@ -406,7 +406,7 @@ def detect_vulnerabilities(target, subdomains, aggressive):
 
 
 # ── Report generation ────────────────────────────────────────────────────────
-def generate_reports(target, subdomains, ports, vulns, header_issues):
+def generate_reports(target, subdomains, ports, vulns, header_issues, usb_results=None):
     section("Generating Reports")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = f"BugHunterPro_Report_{target}_{ts}"
@@ -423,9 +423,14 @@ def generate_reports(target, subdomains, ports, vulns, header_issues):
         "medium":   sum(1 for v in vulns if v.get("severity") == "Medium"),
     }
 
+    usb_findings = (usb_results or {}).get("findings", [])
+    usb_critical = sum(1 for f in usb_findings if f.get("severity") == "Critical")
+    summary["usb_findings"] = len(usb_findings)
+    summary["usb_critical"] = usb_critical
+
     report = {
         "meta": {
-            "tool": "BugHunterPro", "version": "1.1.0",
+            "tool": "BugHunterPro", "version": "1.2.0",
             "target": target, "timestamp": datetime.now().isoformat(), "theme": "miasma",
         },
         "summary": summary,
@@ -433,6 +438,7 @@ def generate_reports(target, subdomains, ports, vulns, header_issues):
         "open_ports": ports,
         "vulnerabilities": vulns_sorted,
         "header_issues": header_issues,
+        "usb_attack": usb_results or {},
     }
 
     json_path = f"{base}.json"
@@ -451,6 +457,7 @@ def generate_reports(target, subdomains, ports, vulns, header_issues):
         f"| Critical         | {summary['critical']} |",
         f"| High             | {summary['high']} |",
         f"| Medium           | {summary['medium']} |",
+        f"| USB findings     | {summary.get('usb_findings', 0)} |",
         "", "## Subdomains",
     ]
     if subdomains:
@@ -484,6 +491,28 @@ def generate_reports(target, subdomains, ports, vulns, header_issues):
         md += ["", "## Missing Security Headers"]
         md += [f"- **{h['header']}** ({h['severity']}): {h['description']}" for h in header_issues]
 
+    if usb_results and usb_results.get("device"):
+        d = usb_results["device"]
+        md += [
+            "", "## USB Attack Module (USBArmyKnife)",
+            f"- **Device:** {d.get('chipModel','?')} fw `{d.get('version','?')}`",
+            f"- **USB mode:** {d.get('USBmode','?')}  |  Agent connected: {d.get('agentConnected','?')}",
+            f"- **Capabilities:** {', '.join(d.get('capabilities', []))}",
+        ]
+        if usb_results.get("payloads_run"):
+            md.append(f"- **Payloads executed:** {', '.join(usb_results['payloads_run'])}")
+        if usb_findings:
+            md += ["", "### USB Findings"]
+            for f in usb_findings:
+                md += [
+                    f"#### [{f['severity']}] {f['type']}",
+                    f"- {f['detail']}",
+                    "",
+                ]
+        if usb_results.get("wifi_aps"):
+            md += ["", "### Nearby WiFi APs (Marauder)"]
+            md += [f"- `{ap}`" for ap in usb_results["wifi_aps"][:20]]
+
     md += ["", "---", "> Only use BugHunterPro on authorized targets."]
 
     md_path = f"{base}.md"
@@ -496,7 +525,9 @@ def generate_reports(target, subdomains, ports, vulns, header_issues):
 
 # ── Public API ───────────────────────────────────────────────────────────────
 class BugHunterPro:
-    def __init__(self, target, mode="normal", verbose=False):
+    def __init__(self, target, mode="normal", verbose=False,
+                 usb_host=None, usb_port=8080,
+                 usb_payloads=None, usb_wifi=False, usb_agent=False):
         t = target.lower().strip()
         for prefix in ("https://", "http://"):
             if t.startswith(prefix):
@@ -505,6 +536,11 @@ class BugHunterPro:
         self.target = t.rstrip("/")
         self.mode = mode
         self.aggressive = mode == "aggressive"
+        self.usb_host = usb_host
+        self.usb_port = usb_port
+        self.usb_payloads = usb_payloads or []
+        self.usb_wifi = usb_wifi
+        self.usb_agent = usb_agent
         logging.basicConfig(
             format=f"{M.GRAY}%(asctime)s %(levelname)s %(message)s{M.RST}",
             datefmt="%H:%M:%S",
@@ -514,6 +550,8 @@ class BugHunterPro:
     def hunt(self):
         banner()
         info(f"Target: {M.PALE}{self.target}{M.RST}  Mode: {M.GOLD}{self.mode}")
+        if self.usb_host:
+            info(f"USB device: {M.GOLD}{self.usb_host}:{self.usb_port}")
         info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         subdomains    = enumerate_subdomains(self.target, self.aggressive)
@@ -522,19 +560,40 @@ class BugHunterPro:
         base_url      = f"https://{self.target}" if 443 in open_port_nos else f"http://{self.target}"
         header_issues = check_security_headers(base_url)
         vulns         = detect_vulnerabilities(self.target, subdomains, self.aggressive)
-        report        = generate_reports(self.target, subdomains, ports, vulns, header_issues)
+
+        usb_results = None
+        if self.usb_host:
+            try:
+                from usb_attack import USBAttackModule
+                mod = USBAttackModule(self.usb_host, self.usb_port)
+                usb_results = mod.run_full(
+                    payloads=self.usb_payloads,
+                    wifi_recon=self.usb_wifi,
+                    agent_recon=self.usb_agent,
+                )
+            except ImportError:
+                warn("usb_attack.py not found — USB module skipped")
+            except Exception as exc:
+                error(f"USB module error: {exc}")
+
+        report = generate_reports(
+            self.target, subdomains, ports, vulns, header_issues, usb_results
+        )
 
         section("Hunt Complete")
         s = report["summary"]
         info(f"Subdomains : {M.GRN}{s['subdomains_found']}")
         info(f"Open ports : {M.GRN}{s['open_ports']}")
         info(f"Findings   : {M.ORG if s['vulnerabilities'] else M.GRN}{s['vulnerabilities']}")
+        if s.get("usb_findings"):
+            info(f"USB hits   : {M.ORG}{s['usb_findings']}")
         if s["critical"]:
             warn(f"Critical   : {s['critical']} — prioritise immediately")
 
         return {
             "subdomains":      {sd["host"] for sd in subdomains},
             "vulnerabilities": vulns,
+            "usb":             usb_results,
             "report":          report,
         }
 
@@ -545,13 +604,35 @@ def main():
         description="BugHunterPro — Automated Bug Bounty Hunting Framework",
         epilog="Only use on authorized targets.",
     )
-    parser.add_argument("--target", "-t", required=True, help="Target domain")
-    parser.add_argument("--mode", "-m", default="normal",
+    parser.add_argument("--target",   "-t", required=True, help="Target domain")
+    parser.add_argument("--mode",     "-m", default="normal",
                         choices=["normal", "aggressive"], help="Scan intensity")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument("--verbose",  "-v", action="store_true", help="Verbose logging")
+
+    usb = parser.add_argument_group("USB attack (USBArmyKnife)")
+    usb.add_argument("--usb-host",    default=None,
+                     help="USBArmyKnife device IP (e.g. 4.3.2.1 or 192.168.4.1)")
+    usb.add_argument("--usb-port",    default=8080, type=int,
+                     help="Device HTTP port (default: 8080)")
+    usb.add_argument("--usb-payload", nargs="*", default=[], dest="usb_payloads",
+                     metavar="NAME",
+                     help="Payload name(s) from built-in library "
+                          "(recon_windows, recon_linux, wifi_creds_windows, …)")
+    usb.add_argument("--usb-wifi",    action="store_true",
+                     help="Run Marauder WiFi AP scan")
+    usb.add_argument("--usb-agent",   action="store_true",
+                     help="Run recon commands via connected agent")
+
     args = parser.parse_args()
 
-    BugHunterPro(args.target, args.mode, args.verbose).hunt()
+    BugHunterPro(
+        args.target, args.mode, args.verbose,
+        usb_host=args.usb_host,
+        usb_port=args.usb_port,
+        usb_payloads=args.usb_payloads,
+        usb_wifi=args.usb_wifi,
+        usb_agent=args.usb_agent,
+    ).hunt()
 
 
 if __name__ == "__main__":

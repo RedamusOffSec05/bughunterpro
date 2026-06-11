@@ -20,6 +20,23 @@ All notable changes to BugHunterPro will be documented in this file.
 - Security header validation
 - Automated reporting
 
+## [1.2.0] - 2026-06-11
+
+### Added
+- `usb_attack.py` — USBArmyKnife hardware attack integration module
+  - `USBArmyKnifeClient`: low-level HTTP client for all device endpoints
+    (`/data.json`, `/runfile`, `/rawinput`, `/runagentcmd`, `/marauder`,
+    `/uploadFile`, `/downloadFile`, `/delete`, `/set`, `/mic`, `/clearlogs`)
+  - `USBAttackModule`: high-level orchestrator — device fingerprint, WiFi recon
+    via Marauder, HID payload delivery, agent command execution, SD card dump
+  - Built-in DuckyScript payload library: `recon_windows`, `recon_linux`,
+    `wifi_creds_windows`, `lock_screen`, `mouse_jiggle`, `open_terminal_linux`
+  - Standalone CLI: `python usb_attack.py --host 4.3.2.1 --payload recon_windows --wifi`
+- BugHunterPro now accepts `--usb-host`, `--usb-port`, `--usb-payload`,
+  `--usb-wifi`, `--usb-agent` flags to chain USB attack into a full scan
+- USB findings merged into JSON and Markdown reports (device fingerprint,
+  WiFi APs, agent output, payload list, severity-tagged findings)
+
 ## [1.1.0] - 2026-06-11
 
 ### Added
