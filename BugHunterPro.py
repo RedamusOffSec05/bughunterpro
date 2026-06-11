@@ -6,6 +6,8 @@ import json
 import logging
 import re
 import socket
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -86,23 +88,42 @@ _SUBS_EXTRA = _SUBS_COMMON + [
 ]
 
 
+_DNS_SEMAPHORE = threading.Semaphore(15)   # cap concurrent DNS queries
+_DNS_RETRIES   = 2                          # retry on transient timeout
+
+
+def _make_resolver():
+    r = dns.resolver.Resolver()
+    r.timeout  = 1.5   # per-attempt timeout
+    r.lifetime = 4.0   # total time across all attempts
+    return r
+
+
 def enumerate_subdomains(domain, aggressive=False):
     section("Subdomain Enumeration")
     wordlist = _SUBS_EXTRA if aggressive else _SUBS_COMMON
-    found = []
-    resolver = dns.resolver.Resolver()
-    resolver.lifetime = 2.0
+    found    = []
 
     def check(sub):
         host = f"{sub}.{domain}"
-        try:
-            answers = resolver.resolve(host, "A")
-            return host, [str(r) for r in answers]
-        except Exception:
-            return None
+        for attempt in range(_DNS_RETRIES):
+            with _DNS_SEMAPHORE:
+                try:
+                    answers = _make_resolver().resolve(host, "A")
+                    return host, [str(r) for r in answers]
+                except dns.resolver.NXDOMAIN:
+                    return None                           # definitive miss
+                except dns.resolver.NoAnswer:
+                    return None
+                except dns.exception.Timeout:
+                    if attempt < _DNS_RETRIES - 1:
+                        time.sleep(0.4 * (attempt + 1))  # back off before retry
+                except Exception:
+                    return None
+        return None
 
     info(f"Checking {len(wordlist)} subdomains against {domain}")
-    with ThreadPoolExecutor(max_workers=30) as pool:
+    with ThreadPoolExecutor(max_workers=15) as pool:
         futures = {pool.submit(check, s): s for s in wordlist}
         for future in as_completed(futures):
             result = future.result()
@@ -144,24 +165,33 @@ def scan_ports(host, aggressive=False):
     ports = _PORTS_AGGRESSIVE if aggressive else _PORTS_COMMON
     open_ports = []
 
+    # Resolve hostname once; avoids repeated per-socket DNS lookups
+    try:
+        target_ip = socket.gethostbyname(host)
+        if target_ip != host:
+            info(f"Resolved: {host} → {target_ip}")
+    except socket.gaierror as exc:
+        error(f"Cannot resolve '{host}': {exc}")
+        return []
+
     def check(port):
         s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(1.0)
-            if s.connect_ex((host, port)) == 0:
+            if s.connect_ex((target_ip, port)) == 0:
                 return {"port": port, "service": _PORT_SERVICES.get(port, "Unknown"), "state": "open"}
-        except Exception:
+        except OSError:
             pass
         finally:
             if s:
                 try:
                     s.close()
-                except Exception:
+                except OSError:
                     pass
         return None
 
-    info(f"Scanning {len(ports)} ports")
+    info(f"Scanning {len(ports)} ports on {target_ip}")
     with ThreadPoolExecutor(max_workers=50) as pool:
         futures = {pool.submit(check, p): p for p in ports}
         for future in as_completed(futures):
