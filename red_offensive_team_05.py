@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AD-Pentest Automation Script
+Red Offensive Team 05 – AD Pentest Automation
 Covers: Network/SMB/LDAP/RPC/Domain Enumeration, Kerberoasting,
 AS-REP Roasting, LLMNR/SMB Relay detection, CrackMapExec spraying,
 Mimikatz/Secretsdump post-exploitation automation.
@@ -520,7 +520,7 @@ def generate_report(ip: str, domain: str):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="AD Pentest Automation – authorized use only",
+        description="Red Offensive Team 05 – AD Pentest Automation (authorized use only)",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     p.add_argument("-t",  "--target",   required=True,  help="Domain Controller IP")
@@ -553,7 +553,7 @@ def main():
     global OUTPUT_DIR
     OUTPUT_DIR = Path(args.output)
 
-    banner("AD Pentest Automation – Authorized Use Only")
+    banner("Red Offensive Team 05 – AD Pentest Automation")
     info(f"Target      : {args.target}")
     info(f"Domain      : {args.domain or '(not set)'}")
     info(f"User        : {args.user   or '(anonymous)'}")
