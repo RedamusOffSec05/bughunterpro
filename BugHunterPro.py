@@ -6,17 +6,33 @@ import json
 import logging
 import re
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, parse_qs
 
+import dns.exception
 import dns.resolver
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 import colorama
+
+# Optional: tqdm progress bars (degrade gracefully if not installed)
+try:
+    from tqdm import tqdm as _Tqdm
+    _TQDM_OK = True
+except ImportError:
+    _TQDM_OK = False
+    class _Tqdm:
+        def __init__(self, *, total=0, desc="", file=None, leave=True, **kw):
+            pass
+        def update(self, n=1): pass
+        def close(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
 
 colorama.init(autoreset=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -46,6 +62,21 @@ def warn(msg):    print(_fmt("!", M.ORG,  msg))
 def error(msg):   print(_fmt("✗", M.RUST, msg))
 def vuln(msg):    print(_fmt("⚡", M.ORG, f"{M.BOLD}{msg}{M.RST}"))
 def section(msg): print(f"\n{M.GOLD}{M.BOLD}  ══ {msg} ══{M.RST}")
+
+
+# ── Audit log ────────────────────────────────────────────────────────────────
+_AUDIT_FILE = "bhp_audit.jsonl"
+
+
+def _audit(action: str, target: str, **extra):
+    """Append a timestamped action record to bhp_audit.jsonl."""
+    entry = {"ts": datetime.now().isoformat(), "action": action, "target": target}
+    entry.update(extra)
+    try:
+        with open(_AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
 
 
 def banner():
@@ -123,14 +154,17 @@ def enumerate_subdomains(domain, aggressive=False):
         return None
 
     info(f"Checking {len(wordlist)} subdomains against {domain}")
+    pbar = _Tqdm(total=len(wordlist), desc="DNS", file=sys.stderr, leave=False)
     with ThreadPoolExecutor(max_workers=15) as pool:
         futures = {pool.submit(check, s): s for s in wordlist}
         for future in as_completed(futures):
             result = future.result()
+            pbar.update(1)
             if result:
                 host, ips = result
                 found.append({"host": host, "ips": ips})
                 success(f"Found: {host}  {M.GRAY}→ {', '.join(ips)}")
+    pbar.close()
 
     if not found:
         warn("No subdomains discovered")
@@ -192,13 +226,16 @@ def scan_ports(host, aggressive=False):
         return None
 
     info(f"Scanning {len(ports)} ports on {target_ip}")
+    pbar = _Tqdm(total=len(ports), desc="Ports", file=sys.stderr, leave=False)
     with ThreadPoolExecutor(max_workers=50) as pool:
         futures = {pool.submit(check, p): p for p in ports}
         for future in as_completed(futures):
             result = future.result()
+            pbar.update(1)
             if result:
                 open_ports.append(result)
                 success(f"Open: {result['port']}/tcp  {M.GRAY}({result['service']})")
+    pbar.close()
 
     if not open_ports:
         warn("No open ports found")
@@ -436,10 +473,12 @@ def detect_vulnerabilities(target, subdomains, aggressive):
 
 
 # ── Report generation ────────────────────────────────────────────────────────
-def generate_reports(target, subdomains, ports, vulns, header_issues, usb_results=None):
+def generate_reports(target, subdomains, ports, vulns, header_issues,
+                     usb_results=None, formats=None, output_dir="."):
     section("Generating Reports")
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = f"BugHunterPro_Report_{target}_{ts}"
+    formats    = formats or ["json", "markdown"]
+    ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base       = f"{output_dir}/BugHunterPro_Report_{target}_{ts}".lstrip("./")
 
     _sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
     vulns_sorted = sorted(vulns, key=lambda v: _sev_order.get(v.get("severity", "Info"), 4))
@@ -550,6 +589,14 @@ def generate_reports(target, subdomains, ports, vulns, header_issues, usb_result
         f.write("\n".join(md))
     success(f"Markdown → {md_path}")
 
+    if "html" in formats:
+        try:
+            from reporter import generate_html
+            html_path = generate_html(report, output_dir=output_dir)
+            success(f"HTML    → {html_path}")
+        except Exception as exc:
+            warn(f"HTML report skipped: {exc}")
+
     return report
 
 
@@ -557,7 +604,9 @@ def generate_reports(target, subdomains, ports, vulns, header_issues, usb_result
 class BugHunterPro:
     def __init__(self, target, mode="normal", verbose=False,
                  usb_host=None, usb_port=8080,
-                 usb_payloads=None, usb_wifi=False, usb_agent=False):
+                 usb_payloads=None, usb_wifi=False, usb_agent=False,
+                 report_formats=None, output_dir=".",
+                 config=None):
         t = target.lower().strip()
         for prefix in ("https://", "http://"):
             if t.startswith(prefix):
@@ -566,11 +615,14 @@ class BugHunterPro:
         self.target = t.rstrip("/")
         self.mode = mode
         self.aggressive = mode == "aggressive"
-        self.usb_host = usb_host
-        self.usb_port = usb_port
-        self.usb_payloads = usb_payloads or []
-        self.usb_wifi = usb_wifi
-        self.usb_agent = usb_agent
+        self.usb_host       = usb_host
+        self.usb_port       = usb_port
+        self.usb_payloads   = usb_payloads or []
+        self.usb_wifi       = usb_wifi
+        self.usb_agent      = usb_agent
+        self.report_formats = report_formats or ["json", "markdown"]
+        self.output_dir     = output_dir
+        self.config         = config or {}
         logging.basicConfig(
             format=f"{M.GRAY}%(asctime)s %(levelname)s %(message)s{M.RST}",
             datefmt="%H:%M:%S",
@@ -583,6 +635,7 @@ class BugHunterPro:
         if self.usb_host:
             info(f"USB device: {M.GOLD}{self.usb_host}:{self.usb_port}")
         info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        _audit("hunt_start", self.target, mode=self.mode, usb=self.usb_host)
 
         subdomains    = enumerate_subdomains(self.target, self.aggressive)
         ports         = scan_ports(self.target, self.aggressive)
@@ -608,8 +661,11 @@ class BugHunterPro:
                 error(f"USB module error: {exc}")
 
         report = generate_reports(
-            self.target, subdomains, ports, vulns, header_issues, usb_results
+            self.target, subdomains, ports, vulns, header_issues, usb_results,
+            formats=self.report_formats, output_dir=self.output_dir,
         )
+        _audit("hunt_complete", self.target,
+               subdomains=len(subdomains), ports=len(ports), vulns=len(vulns))
 
         section("Hunt Complete")
         s = report["summary"]
@@ -630,40 +686,122 @@ class BugHunterPro:
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
+def _add_common(p):
+    p.add_argument("--target",  "-t", required=True, help="Target domain")
+    p.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
+    p.add_argument("--config",  "-c", default=None, metavar="FILE",
+                   help="YAML/JSON config file (auto-detects bhp.yaml if present)")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="BugHunterPro — Automated Bug Bounty Hunting Framework",
-        epilog="Only use on authorized targets.",
+        prog="BugHunterPro",
+        description="Automated Bug Bounty Hunting Framework — miasma edition",
+        epilog="Only use on systems you are authorized to test.",
     )
-    parser.add_argument("--target",   "-t", required=True, help="Target domain")
-    parser.add_argument("--mode",     "-m", default="normal",
-                        choices=["normal", "aggressive"], help="Scan intensity")
-    parser.add_argument("--verbose",  "-v", action="store_true", help="Verbose logging")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = False   # no subcommand → fall through to scan
 
-    usb = parser.add_argument_group("USB attack (USBArmyKnife)")
-    usb.add_argument("--usb-host",    default=None,
-                     help="USBArmyKnife device IP (e.g. 4.3.2.1 or 192.168.4.1)")
-    usb.add_argument("--usb-port",    default=8080, type=int,
-                     help="Device HTTP port (default: 8080)")
+    # ── scan (default) ───────────────────────────────────────────────────────
+    scan_p = sub.add_parser("scan", help="Full vulnerability scan (default)")
+    _add_common(scan_p)
+    scan_p.add_argument("--mode", "-m", default="normal",
+                        choices=["normal", "aggressive"], help="Scan intensity")
+    scan_p.add_argument("--html",  action="store_true", help="Also generate HTML report")
+    scan_p.add_argument("--output-dir", default=".", dest="output_dir",
+                        help="Report output directory (default: .)")
+    usb = scan_p.add_argument_group("USB attack (USBArmyKnife)")
+    usb.add_argument("--usb-host",    default=None, metavar="IP")
+    usb.add_argument("--usb-port",    default=8080, type=int)
     usb.add_argument("--usb-payload", nargs="*", default=[], dest="usb_payloads",
                      metavar="NAME",
-                     help="Payload name(s) from built-in library "
-                          "(recon_windows, recon_linux, wifi_creds_windows, …)")
-    usb.add_argument("--usb-wifi",    action="store_true",
-                     help="Run Marauder WiFi AP scan")
-    usb.add_argument("--usb-agent",   action="store_true",
-                     help="Run recon commands via connected agent")
+                     help="recon_windows | recon_linux | wifi_creds_windows | lock_screen | …")
+    usb.add_argument("--usb-wifi",  action="store_true")
+    usb.add_argument("--usb-agent", action="store_true")
+
+    # ── recon ────────────────────────────────────────────────────────────────
+    recon_p = sub.add_parser("recon", help="Passive/active reconnaissance only")
+    _add_common(recon_p)
+    recon_p.add_argument("--passive", action="store_true", default=True,
+                         help="DNS records, zone transfer, WHOIS (default: on)")
+    recon_p.add_argument("--banner",  action="store_true",
+                         help="Banner grabbing (version disclosure)")
+
+    # ── creds ────────────────────────────────────────────────────────────────
+    creds_p = sub.add_parser("creds", help="Credential testing (SSH, FTP, HTTP)")
+    _add_common(creds_p)
+    creds_p.add_argument("--wordlist", default=None,
+                         help="Path to newline-separated user:pass credential file")
+    creds_p.add_argument("--rate", type=float, default=2.0,
+                         help="Max attempts per second (default: 2.0)")
 
     args = parser.parse_args()
 
-    BugHunterPro(
-        args.target, args.mode, args.verbose,
-        usb_host=args.usb_host,
-        usb_port=args.usb_port,
-        usb_payloads=args.usb_payloads,
-        usb_wifi=args.usb_wifi,
-        usb_agent=args.usb_agent,
-    ).hunt()
+    # Load config file
+    cfg = {}
+    try:
+        import config as _cfg
+        cfg = _cfg.load(getattr(args, "config", None))
+    except Exception:
+        pass
+
+    # Dispatch
+    cmd = getattr(args, "command", None) or "scan"
+
+    if cmd == "recon":
+        _audit("recon_start", args.target)
+        from modules.passive_recon import PassiveReconModule, BannerGrabModule
+        results = []
+        if args.passive:
+            m = PassiveReconModule(cfg)
+            results += m.execute(args.target)
+        if args.banner:
+            m = BannerGrabModule(cfg)
+            results += m.execute(args.target)
+        section("Recon Complete")
+        info(f"{len(results)} finding(s)")
+        print(json.dumps(results, indent=2))
+        _audit("recon_complete", args.target, findings=len(results))
+
+    elif cmd == "creds":
+        _audit("creds_start", args.target)
+        from modules.credentials import CredentialModule
+        cred_cfg = dict(cfg.get("credentials", {}))
+        cred_cfg["rate"] = args.rate
+        if args.wordlist:
+            pairs = []
+            with open(args.wordlist) as f:
+                for line in f:
+                    line = line.strip()
+                    if ":" in line:
+                        u, p = line.split(":", 1)
+                        pairs.append((u, p))
+            cred_cfg["wordlist"] = pairs
+        m = CredentialModule(cred_cfg)
+        results = m.execute(args.target)
+        section("Credential Testing Complete")
+        info(f"{len(results)} valid credential(s) found")
+        print(json.dumps(results, indent=2))
+        _audit("creds_complete", args.target, findings=len(results))
+
+    else:  # scan (default)
+        formats = ["json", "markdown"]
+        if getattr(args, "html", False):
+            formats.append("html")
+
+        BugHunterPro(
+            getattr(args, "target", None) or parser.parse_args(["scan", "--help"]),
+            getattr(args, "mode", "normal"),
+            getattr(args, "verbose", False),
+            usb_host     = getattr(args, "usb_host",    None),
+            usb_port     = getattr(args, "usb_port",    8080),
+            usb_payloads = getattr(args, "usb_payloads", []),
+            usb_wifi     = getattr(args, "usb_wifi",    False),
+            usb_agent    = getattr(args, "usb_agent",   False),
+            report_formats = formats,
+            output_dir   = getattr(args, "output_dir",  "."),
+            config       = cfg,
+        ).hunt()
 
 
 if __name__ == "__main__":
