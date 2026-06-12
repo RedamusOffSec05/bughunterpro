@@ -234,7 +234,6 @@ def phase_windapsearch(ip: str, domain: str, user: str = "", password: str = "")
         warn("windapsearch not found – skipping.")
         return
 
-    anon_flag = ""
     auth_flag = f"-u '{domain}\\\\{user}' -p '{password}'" if (user and password) else ""
 
     info("Enumerate users")
@@ -527,6 +526,8 @@ def parse_args():
     p.add_argument("-d",  "--domain",   default="",     help="Domain (e.g. htb.local)")
     p.add_argument("-u",  "--user",     default="",     help="Username")
     p.add_argument("-p",  "--password", default="",     help="Password")
+    p.add_argument("-pf", "--password-file", default="", metavar="FILE",
+                   help="Read password from file (avoids shell history exposure)")
     p.add_argument("-H",  "--hash",     default="",     help="NTLM hash for PTH")
     p.add_argument("-uf", "--userfile", default="",     help="Path to username wordlist")
     p.add_argument("-c",  "--cidr",     default="",     help="CIDR range for CME spraying")
@@ -552,6 +553,14 @@ def main():
 
     global OUTPUT_DIR
     OUTPUT_DIR = Path(args.output)
+
+    if args.password_file:
+        pf = Path(args.password_file)
+        if not pf.exists():
+            err(f"Password file not found: {pf}")
+            sys.exit(1)
+        args.password = pf.read_text().strip()
+        info(f"Password loaded from {pf}")
 
     banner("Red Offensive Team 05 – AD Pentest Automation")
     info(f"Target      : {args.target}")
