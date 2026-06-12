@@ -37,7 +37,7 @@ import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from getpass import getpass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -115,6 +115,18 @@ class PhaseCheckpoint:
     output_size: int
     error:       Optional[str] = None
 
+# ──────────────────────────────────────────────────────────────────────────────
+# EXIT CODES  (recommendation 6)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ExitCode(IntEnum):
+    SUCCESS          = 0   # all phases completed cleanly
+    GENERAL_ERROR    = 1   # unhandled exception
+    COMPLIANCE_FAIL  = 2   # outside authorised time window
+    MISSING_TARGET   = 3   # -t not supplied in non-interactive mode
+    CONFIG_ERROR     = 4   # bad/missing config file
+    ENCRYPT_ERROR    = 5   # encryption setup failed
+
 class CheckpointManager:
     def __init__(self, output_dir: Path):
         self.output_dir      = output_dir
@@ -172,6 +184,109 @@ class CheckpointManager:
 
     def should_skip(self, name: str, force: bool = False) -> bool:
         return (not force) and self.is_done(name)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG FILE  (recommendation 1)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ConfigFile:
+    """Persistent JSON config — passwords and hashes are never persisted."""
+    _SAFE_KEYS = frozenset({
+        "ip", "domain", "username", "ca_server",
+        "exchange_server", "sql_server", "interface",
+    })
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def _load_raw(self) -> Dict:
+        if not self.path.exists():
+            return {}
+        try:
+            return json.loads(self.path.read_text())
+        except Exception as exc:
+            warn(f"Config file read error: {exc}")
+            return {}
+
+    def apply(self, cfg: "TargetConfig") -> None:
+        """Populate cfg from file; CLI args applied afterwards will override."""
+        for k, v in self._load_raw().items():
+            if k in self._SAFE_KEYS and hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+    def save(self, cfg: "TargetConfig") -> None:
+        """Persist safe fields only — never passwords or hashes."""
+        data = {k: getattr(cfg, k, "") for k in sorted(self._SAFE_KEYS)
+                if getattr(cfg, k, "")}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(data, indent=2))
+            success(f"Config saved → {self.path}")
+        except Exception as exc:
+            err(f"Failed to save config: {exc}")
+            sys.exit(ExitCode.CONFIG_ERROR)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RESULT ENCRYPTOR  (recommendation 2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResultEncryptor:
+    """Fernet symmetric encryption for sensitive output directories.
+
+    Key is derived via PBKDF2-HMAC-SHA256 from a user passphrase so
+    the raw key is never stored on disk.
+    """
+    SENSITIVE_DIRS = frozenset({"kerberoast", "asrep", "secrets", "dpapi"})
+
+    def __init__(self, passphrase: str, output_dir: Path):
+        try:
+            import base64
+            from cryptography.fernet import Fernet
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            from cryptography.hazmat.primitives import hashes as _ch
+        except ImportError:
+            err("cryptography not installed — run: pip install cryptography>=41.0.0")
+            sys.exit(ExitCode.ENCRYPT_ERROR)
+
+        salt_file = output_dir / ".salt"
+        if salt_file.exists():
+            salt = salt_file.read_bytes()
+        else:
+            salt = os.urandom(16)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            salt_file.write_bytes(salt)
+
+        kdf = PBKDF2HMAC(
+            algorithm=_ch.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=480_000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode()))
+        self._fernet = Fernet(key)
+
+    def encrypt_dir(self, path: Path) -> int:
+        """Encrypt .txt/.json files in place; returns count encrypted."""
+        if not path.exists():
+            return 0
+        count = 0
+        for f in sorted(path.rglob("*")):
+            if f.is_file() and f.suffix in {".txt", ".json"} \
+                    and not f.name.endswith(".enc"):
+                enc_path = f.with_name(f.name + ".enc")
+                enc_path.write_bytes(self._fernet.encrypt(f.read_bytes()))
+                f.unlink()
+                count += 1
+        return count
+
+    def encrypt_sensitive(self, output_dir: Path) -> None:
+        total = 0
+        for d in sorted(self.SENSITIVE_DIRS):
+            n = self.encrypt_dir(output_dir / d)
+            if n:
+                success(f"Encrypted {n} file(s) in {d}/")
+                total += n
+        (success if total else info)(f"Encryption complete — {total} file(s) secured")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RATE LIMITER  — FIX: removed dead elif branch
@@ -250,6 +365,7 @@ config = TargetConfig()
 # ──────────────────────────────────────────────────────────────────────────────
 
 OUTPUT_DIR: Path = Path("rot05_output")
+DRY_RUN:    bool = False                  # set by --dry-run (recommendation 3)
 
 def ensure_dir(subdir: str = "") -> Path:
     d = OUTPUT_DIR / subdir if subdir else OUTPUT_DIR
@@ -308,6 +424,9 @@ def run(cmd: List[str], outfile: Optional[Path] = None,
     cmd_log = _redact(cmd) if isinstance(cmd, list) else cmd
     step(f"Running: {cmd_log}")
     logger.info("CMD: %s", cmd_log)
+    if DRY_RUN:
+        info(f"[DRY-RUN] Would execute: {cmd_log}")
+        return "", 0
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True, text=True, timeout=timeout
@@ -1249,13 +1368,57 @@ Examples:
                    help="Enforce authorized hours window before running")
     p.add_argument("--window-start", type=int, default=8,  metavar="HOUR")
     p.add_argument("--window-end",   type=int, default=18, metavar="HOUR")
+    # Recommendation 1: config file
+    p.add_argument("--config",        metavar="PATH",
+                   help="Load persistent settings from JSON config file")
+    p.add_argument("--save-config",   action="store_true",
+                   help="Save non-sensitive settings to config file then exit")
+    # Recommendation 2: result encryption
+    p.add_argument("--encrypt-results", action="store_true",
+                   help="Encrypt sensitive output dirs after run completes")
+    p.add_argument("--passphrase",    metavar="PHRASE",
+                   help="Encryption passphrase (prefer --passphrase-file)")
+    p.add_argument("--passphrase-file", metavar="FILE",
+                   help="Read encryption passphrase from file")
+    # Recommendation 3: dry-run
+    p.add_argument("--dry-run",       action="store_true",
+                   help="Print commands without executing them")
     return p.parse_args()
+
+
+def _resolve_passphrase(args) -> str:
+    """Return encryption passphrase from CLI arg, file, or interactive prompt."""
+    if args.passphrase:
+        return args.passphrase
+    if args.passphrase_file:
+        try:
+            return Path(args.passphrase_file).read_text().strip()
+        except Exception as exc:
+            err(f"Cannot read passphrase file: {exc}")
+            sys.exit(ExitCode.ENCRYPT_ERROR)
+    return getpass("Encryption passphrase: ")
 
 
 def main():
     args = parse_args()
 
-    # Populate config
+    # ── Recommendation 3: activate dry-run before any run() call ────────────
+    global DRY_RUN
+    if args.dry_run:
+        DRY_RUN = True
+        warn("DRY-RUN mode active — commands will be printed, not executed")
+
+    # ── Recommendation 1: load config file first; CLI args override below ───
+    cfg_file: Optional[ConfigFile] = None
+    if args.config:
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            err(f"Config file not found: {cfg_path}")
+            sys.exit(ExitCode.CONFIG_ERROR)
+        cfg_file = ConfigFile(cfg_path)
+        cfg_file.apply(config)
+
+    # Populate config (CLI values override any file-loaded values)
     if args.target:          config.ip              = args.target
     if args.domain:          config.domain          = args.domain
     if args.username:        config.username        = args.username
@@ -1275,19 +1438,24 @@ def main():
     # FIX: logging deferred until output_dir is known
     setup_logging(OUTPUT_DIR)
 
+    # ── Recommendation 1: optionally save config then continue ──────────────
+    if args.save_config:
+        save_path = Path(args.config) if args.config else OUTPUT_DIR / "rot05_config.json"
+        ConfigFile(save_path).save(config)
+
     if args.prompt_password and not config.password and config.username:
         config.password = getpass(f"Password for {config.username}@{config.domain}: ")
 
     main_banner()
 
-    # FIX: ComplianceChecker wired into main()
+    # ── Recommendation 6: proper exit codes for compliance failure ───────────
     if args.check_window:
         checker = ComplianceChecker(args.window_start, args.window_end)
         ok, msg = checker.check()
         if not ok:
             err(f"Compliance check failed: {msg}")
-            err("Pass --no-check-window or adjust --window-start/--window-end to override.")
-            sys.exit(1)
+            err("Adjust --window-start/--window-end to override.")
+            sys.exit(ExitCode.COMPLIANCE_FAIL)
         success(f"Compliance: {msg}")
 
     if args.interactive or not args.target:
@@ -1346,7 +1514,14 @@ def main():
         _phase("bloodhound",  lambda: BloodHound.collect(args.bloodhound), ckpt, force)
 
     generate_report()
+
+    # ── Recommendation 2: encrypt sensitive results ──────────────────────────
+    if args.encrypt_results:
+        passphrase = _resolve_passphrase(args)
+        ResultEncryptor(passphrase, OUTPUT_DIR).encrypt_sensitive(OUTPUT_DIR)
+
     success(f"Done — results in {OUTPUT_DIR}")
+    sys.exit(ExitCode.SUCCESS)
 
 
 if __name__ == "__main__":
@@ -1358,4 +1533,4 @@ if __name__ == "__main__":
     except Exception as exc:
         err(f"Fatal: {exc}")
         logger.critical("Unhandled exception", exc_info=True)
-        sys.exit(1)
+        sys.exit(ExitCode.GENERAL_ERROR)
