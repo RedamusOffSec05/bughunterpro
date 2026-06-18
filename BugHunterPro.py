@@ -4,6 +4,7 @@
 import argparse
 import json
 import logging
+import os
 import re
 import socket
 import sys
@@ -478,7 +479,7 @@ def generate_reports(target, subdomains, ports, vulns, header_issues,
     section("Generating Reports")
     formats    = formats or ["json", "markdown"]
     ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base       = f"{output_dir}/BugHunterPro_Report_{target}_{ts}".lstrip("./")
+    base       = os.path.join(output_dir, f"BugHunterPro_Report_{target}_{ts}")
 
     _sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
     vulns_sorted = sorted(vulns, key=lambda v: _sev_order.get(v.get("severity", "Info"), 4))

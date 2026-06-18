@@ -5,8 +5,12 @@ colorama>=0.4.6
 beautifulsoup4>=4.11.0
 dnspython>=2.3.0
 
+# Testing & coverage
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
 # Optional — enhanced features (install as needed)
-# tqdm>=4.64.0          # progress bars  (pip install tqdm)
-# pyyaml>=6.0           # YAML config files  (pip install pyyaml)
-# python-whois>=0.8.0   # WHOIS lookups  (pip install python-whois)
-# paramiko>=3.0.0       # SSH credential testing  (pip install paramiko)
+# tqdm>=4.64.0          # progress bars           (pip install tqdm)
+# pyyaml>=6.0           # YAML config files        (pip install pyyaml)
+# python-whois>=0.8.0   # WHOIS lookups            (pip install python-whois)
+# paramiko>=3.0.0       # SSH credential testing   (pip install paramiko)
