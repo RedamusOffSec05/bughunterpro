@@ -1,5 +1,15 @@
-﻿requests>=2.28.0
-urllib3>=1.26.0
+# ── Core runtime ────────────────────────────────────────────────────────────
 colorama>=0.4.6
+cryptography>=41.0.0
+requests>=2.28.0
+urllib3>=1.26.0
+
+# ── Optional: enhanced enumeration ──────────────────────────────────────────
 beautifulsoup4>=4.11.0
 dnspython>=2.3.0
+
+# ── Optional: impacket suite (kerberoast, secretsdump, ticketer, etc.) ──────
+# impacket>=0.11.0
+
+# ── Optional: AD CS attacks ──────────────────────────────────────────────────
+# certipy-ad>=4.0.0
