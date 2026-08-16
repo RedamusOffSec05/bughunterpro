@@ -1115,20 +1115,532 @@ class CVEScanner:
         return results
 
 # ──────────────────────────────────────────────────────────────────────────────
-# REPORT  — FIX: wired with calculate_file_hash for evidence integrity
+# REMEDIATION DATABASE
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SEVER_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+
+REMEDIATION_DB: Dict[str, Dict] = {
+    "kerberoast": {
+        "title": "Kerberoastable Service Accounts",
+        "severity": "High",
+        "description": (
+            "Service accounts with SPNs allow any authenticated user to request TGS tickets "
+            "and crack them offline with hashcat (mode 13100)."
+        ),
+        "remediation": [
+            "Replace service accounts with Group Managed Service Accounts (gMSA) — passwords auto-rotate with 128-char entropy.",
+            "Where gMSA is not possible, enforce passwords >25 random characters.",
+            "Audit SPNs: Get-ADUser -Filter {ServicePrincipalName -ne '$null'} -Properties ServicePrincipalName",
+            "Enable AES-256 encryption and remove RC4 support (msDS-SupportedEncryptionTypes = 24).",
+        ],
+        "mitre": "T1558.003",
+        "references": ["https://attack.mitre.org/techniques/T1558/003/"],
+    },
+    "asreproast": {
+        "title": "AS-REP Roastable Accounts",
+        "severity": "High",
+        "description": (
+            "Accounts with 'Do not require Kerberos preauthentication' (DONT_REQ_PREAUTH) "
+            "allow unauthenticated AS-REP hash extraction and offline cracking."
+        ),
+        "remediation": [
+            "Enable Kerberos preauthentication on all accounts.",
+            "Audit: Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true} -Properties DoesNotRequirePreAuth",
+            "If preauthentication must remain disabled, enforce passwords >25 random characters.",
+        ],
+        "mitre": "T1558.004",
+        "references": ["https://attack.mitre.org/techniques/T1558/004/"],
+    },
+    "cpassword": {
+        "title": "GPP cPassword in SYSVOL (MS14-025)",
+        "severity": "Critical",
+        "description": (
+            "Group Policy Preferences can store credentials (cPassword) encrypted with a "
+            "publicly disclosed AES key. Any domain user can decrypt these trivially."
+        ),
+        "remediation": [
+            "Apply MS14-025 (KB2962486) on all Group Policy management systems.",
+            "Delete all Groups.xml, Services.xml, ScheduledTasks.xml, DataSources.xml containing cpassword from SYSVOL.",
+            "Reset passwords for every account found in GPP files.",
+            "Deploy LAPS to manage local admin passwords going forward.",
+        ],
+        "mitre": "T1552.006",
+        "references": [
+            "https://support.microsoft.com/kb/2962486",
+            "https://attack.mitre.org/techniques/T1552/006/",
+        ],
+    },
+    "smb_signing_disabled": {
+        "title": "SMB Signing Not Required",
+        "severity": "Medium",
+        "description": (
+            "SMB signing is disabled or not required, enabling NTLM relay attacks "
+            "that can escalate any captured NTLMv2 hash to full host compromise."
+        ),
+        "remediation": [
+            "Enable and require SMB signing via GPO: Computer Config → Windows Settings → Security Settings → Local Policies → Security Options → 'Microsoft network server: Digitally sign communications (always)' = Enabled.",
+            "Also enable 'Microsoft network client: Digitally sign communications (always)'.",
+            "Test compatibility with legacy devices before broad enforcement.",
+        ],
+        "mitre": "T1557.001",
+        "references": ["https://attack.mitre.org/techniques/T1557/001/"],
+    },
+    "anon_ldap": {
+        "title": "Anonymous LDAP Access Permitted",
+        "severity": "Medium",
+        "description": (
+            "The domain controller accepts unauthenticated LDAP queries, allowing "
+            "anyone on the network to enumerate users, groups, and OUs without credentials."
+        ),
+        "remediation": [
+            "Set dsHeuristics bit 7 to 0 to disable anonymous LDAP.",
+            "Apply KB4520412 (2020 LDAP channel binding and signing requirements).",
+            "Monitor anonymous LDAP queries via Event ID 2889 in the Directory Service log.",
+        ],
+        "mitre": "T1087.002",
+        "references": ["https://support.microsoft.com/topic/2020-ldap-channel-binding-and-ldap-signing-kb4520412"],
+    },
+    "adcs_vulnerable": {
+        "title": "Vulnerable AD CS Certificate Templates",
+        "severity": "Critical",
+        "description": (
+            "Certificate templates are misconfigured (ESC1–ESC8), enabling privilege "
+            "escalation to Domain Admin via certificate abuse."
+        ),
+        "remediation": [
+            "Remove 'Enrollee Supplies Subject' from unprivileged templates (ESC1 fix).",
+            "Disable the EDITF_ATTRIBUTESUBJECTALTNAME2 CA flag (ESC6 fix).",
+            "Require CA Manager Approval for any template that issues machine or DC certificates.",
+            "Apply Microsoft's May 2022 AD CS hardening patches.",
+            "Re-audit with: certipy find -u user@domain -p pass -dc-ip <IP> -vulnerable",
+        ],
+        "mitre": "T1649",
+        "references": ["https://posts.specterops.io/certified-pre-owned-d95910965cd2"],
+    },
+    "secrets_dumped": {
+        "title": "NTLM Hashes / Domain Secrets Extracted",
+        "severity": "Critical",
+        "description": (
+            "Domain credential hashes (including KRBTGT) were successfully extracted via "
+            "DCSync. An attacker with these hashes can forge Golden Tickets valid for 10 years."
+        ),
+        "remediation": [
+            "Rotate the krbtgt password TWICE with a 10-hour gap to invalidate all Kerberos tickets.",
+            "Reset every account whose hash was extracted.",
+            "Investigate and remove the replication (DCSync) rights that were abused.",
+            "Enable Protected Users Security Group for all tier-0 accounts.",
+            "Deploy Microsoft Credential Guard on privileged workstations.",
+            "Implement a tiered administration model to contain lateral movement.",
+        ],
+        "mitre": "T1003.006",
+        "references": ["https://attack.mitre.org/techniques/T1003/006/"],
+    },
+    "dpapi_backup": {
+        "title": "DPAPI Domain Backup Key Extracted",
+        "severity": "Critical",
+        "description": (
+            "The domain-wide DPAPI backup key was extracted. This key decrypts every "
+            "DPAPI-protected secret (saved passwords, certificate private keys, Wi-Fi PSKs) "
+            "on every machine in the domain, past and present."
+        ),
+        "remediation": [
+            "Treat the backup key as permanently compromised; initiate incident response.",
+            "Contact Microsoft support to rotate the backup key (no self-service rotation exists).",
+            "Audit and rotate all DPAPI-protected secrets across the domain.",
+            "Rotate all service account passwords, Wi-Fi PSKs, and stored browser credentials.",
+        ],
+        "mitre": "T1555.004",
+        "references": ["https://attack.mitre.org/techniques/T1555/004/"],
+    },
+    "CVE-2020-1472": {
+        "title": "Zerologon (CVE-2020-1472)",
+        "severity": "Critical",
+        "description": (
+            "A cryptographic flaw in Netlogon allows an unauthenticated attacker to "
+            "impersonate any domain computer and gain Domain Admin access in seconds."
+        ),
+        "remediation": [
+            "Apply Microsoft August 2020 cumulative update immediately.",
+            "Enforce Netlogon secure channel: FullSecureChannelProtection=1 in HKLM\\SYSTEM\\CurrentControlSet\\Services\\Netlogon\\Parameters.",
+            "Monitor Event IDs 5827–5831 in the System log for exploitation attempts.",
+        ],
+        "mitre": "T1210",
+        "references": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2020-1472"],
+    },
+    "CVE-2021-26855": {
+        "title": "ProxyLogon (CVE-2021-26855)",
+        "severity": "Critical",
+        "description": (
+            "An SSRF vulnerability in Exchange Server allows pre-authenticated RCE "
+            "as SYSTEM via crafted HTTP requests."
+        ),
+        "remediation": [
+            "Apply Exchange Server March 2021 Security Update immediately.",
+            "If patching is delayed, run Microsoft's ExchangeMitigations.ps1 IIS URL rewrite rules.",
+            "Restrict /autodiscover/, /ews/, and /owa/ to known IP ranges at the WAF.",
+        ],
+        "mitre": "T1190",
+        "references": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-26855"],
+    },
+    "CVE-2021-34473": {
+        "title": "ProxyShell (CVE-2021-34473)",
+        "severity": "Critical",
+        "description": (
+            "A URL confusion + ACL bypass + deserialization chain in Exchange allows "
+            "pre-authenticated RCE as SYSTEM."
+        ),
+        "remediation": [
+            "Apply Exchange July 2021 Cumulative Update + Security Update.",
+            "Block autodiscover paths at the WAF/reverse proxy.",
+            "Enable AMSI integration for Exchange to detect web shell uploads.",
+        ],
+        "mitre": "T1190",
+        "references": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34473"],
+    },
+    "CVE-2019-1040": {
+        "title": "PrivExchange NTLM Relay (CVE-2019-1040)",
+        "severity": "High",
+        "description": (
+            "Exchange's push-notification mechanism can relay its high-privilege credentials "
+            "to LDAP, granting DCSync rights to an attacker."
+        ),
+        "remediation": [
+            "Apply KB4490060 / KB4487563.",
+            "Enable LDAP signing and channel binding on all domain controllers.",
+            "Remove Exchange's over-privileged AD rights using the PrivExchange remediation script.",
+            "Enable Extended Protection for Authentication (EPA) on Exchange.",
+        ],
+        "mitre": "T1557",
+        "references": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2019-1040"],
+    },
+    "MS17-010": {
+        "title": "EternalBlue (MS17-010)",
+        "severity": "Critical",
+        "description": (
+            "SMBv1 remote code execution used by WannaCry/NotPetya ransomware. "
+            "Allows unauthenticated RCE as SYSTEM on unpatched Windows machines."
+        ),
+        "remediation": [
+            "Apply MS17-010 security update immediately.",
+            "Disable SMBv1: Set-SmbServerConfiguration -EnableSMB1Protocol $false",
+            "Block port 445 from all internet-facing interfaces.",
+            "Block workstation-to-workstation SMB with host-based firewall rules.",
+        ],
+        "mitre": "T1210",
+        "references": ["https://support.microsoft.com/topic/ms17-010-security-update-march-2017"],
+    },
+    "CVE-2020-0618": {
+        "title": "SQL Server Reporting Services RCE (CVE-2020-0618)",
+        "severity": "High",
+        "description": (
+            "A deserialization vulnerability in SQL Server Reporting Services (SSRS) "
+            "allows an authenticated attacker to execute arbitrary code as the service account."
+        ),
+        "remediation": [
+            "Apply February 2020 SQL Server security update (KB4532095 / KB4532097).",
+            "Restrict SSRS to internal networks only — never expose to the internet.",
+            "Disable SSRS if it is not actively used.",
+        ],
+        "mitre": "T1210",
+        "references": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2020-0618"],
+    },
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REPORT HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _collect_findings() -> List[Dict]:
+    """Scan output files and return a sorted list of structured finding dicts."""
+    findings: List[Dict] = []
+
+    def _add(key: str, evidence: str = "") -> None:
+        rec = REMEDIATION_DB.get(key)
+        if rec:
+            findings.append({
+                "key":         key,
+                "title":       rec["title"],
+                "severity":    rec["severity"],
+                "description": rec["description"],
+                "remediation": rec["remediation"],
+                "mitre":       rec.get("mitre", ""),
+                "references":  rec.get("references", []),
+                "evidence":    evidence,
+            })
+
+    p = OUTPUT_DIR
+
+    # Kerberoast
+    f = p / "kerberoast" / "hashes.txt"
+    if f.exists() and f.stat().st_size > 0:
+        _add("kerberoast")
+
+    # AS-REP
+    f = p / "asrep" / "hashes.txt"
+    if f.exists() and f.stat().st_size > 0:
+        _add("asreproast")
+
+    # GPP cPassword
+    f = p / "gpo" / "cpassword_results.txt"
+    if f.exists() and "cpassword" in f.read_text().lower():
+        _add("cpassword")
+
+    # SMB signing
+    f = p / "smb" / "smb-signing.txt"
+    if f.exists() and "message_signing: disabled" in f.read_text().lower():
+        _add("smb_signing_disabled")
+
+    # Anonymous LDAP (non-trivial response → access allowed)
+    f = p / "ldap" / "anon-base-dump.txt"
+    if f.exists() and f.stat().st_size > 200:
+        _add("anon_ldap")
+
+    # AD CS vulnerable templates
+    f = p / "adcs" / "ca_discovery.txt"
+    if f.exists() and "VULNERABLE" in f.read_text():
+        _add("adcs_vulnerable")
+
+    # Secrets / DCSync
+    d = p / "secrets"
+    if d.exists() and any(d.iterdir()):
+        _add("secrets_dumped")
+
+    # DPAPI backup key
+    d = p / "dpapi"
+    if d.exists() and any(d.iterdir()):
+        _add("dpapi_backup")
+
+    # CVE scanner results
+    f = p / "cves" / "scan_results.json"
+    if f.exists():
+        try:
+            for r in json.loads(f.read_text()):
+                _add(r["cve"], r.get("details", "")[:200])
+        except Exception:
+            pass
+
+    findings.sort(key=lambda x: _SEVER_ORDER.get(x["severity"], 99))
+    return findings
+
+
+_SEVER_CSS = {
+    "Critical": "#e53e3e",
+    "High":     "#dd6b20",
+    "Medium":   "#d69e2e",
+    "Low":      "#3182ce",
+    "Info":     "#718096",
+}
+
+
+def generate_html_report(findings: List[Dict]) -> Path:
+    """Produce a self-contained dark-theme HTML report. Returns the output path."""
+    out_path = ensure_dir() / "REPORT.html"
+    now      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    services = detect_services(config.ip) if config.ip else {}
+    active   = [s for s, up in services.items() if up]
+
+    counts = {s: sum(1 for f in findings if f["severity"] == s)
+              for s in ["Critical", "High", "Medium", "Low", "Info"]}
+
+    # Evidence integrity rows
+    ev_rows = ""
+    if OUTPUT_DIR.exists():
+        for subdir in sorted(OUTPUT_DIR.iterdir()):
+            if subdir.is_dir():
+                for fp in sorted(subdir.iterdir()):
+                    if fp.is_file() and not fp.name.startswith("."):
+                        sha  = calculate_file_hash(fp)
+                        size = fp.stat().st_size
+                        ev_rows += (
+                            f"<tr><td>{subdir.name}/{fp.name}</td>"
+                            f"<td>{size:,}</td>"
+                            f"<td class='mono'>{sha[:16]}…</td></tr>\n"
+                        )
+
+    # Finding cards
+    cards = ""
+    for i, f in enumerate(findings):
+        color  = _SEVER_CSS.get(f["severity"], "#718096")
+        rems   = "".join(f"<li>{r}</li>" for r in f["remediation"])
+        refs   = "".join(f'<a href="{r}" class="ref">{r}</a>' for r in f["references"])
+        mitre  = (f'<span class="mitre">MITRE&nbsp;{f["mitre"]}</span>'
+                  if f["mitre"] else "")
+        evid   = (f'<p class="evid"><strong>Evidence:</strong> {f["evidence"]}</p>'
+                  if f.get("evidence") else "")
+        cards += f"""
+        <div class="card" id="f{i}">
+          <div class="card-hdr" style="border-left:4px solid {color}">
+            <span class="badge" style="background:{color}">{f['severity']}</span>
+            <span class="card-title">{f['title']}</span>
+            {mitre}
+          </div>
+          <div class="card-body">
+            <p class="desc">{f['description']}</p>
+            {evid}
+            <h4>Remediation Steps</h4>
+            <ol class="rlist">{rems}</ol>
+            <div class="refs">{refs}</div>
+          </div>
+        </div>"""
+
+    # Severity summary bars
+    bars = ""
+    for sev, cnt in counts.items():
+        if cnt:
+            color = _SEVER_CSS[sev]
+            w     = min(cnt * 30, 300)
+            bars += (
+                f'<div class="srow">'
+                f'<span class="slbl">{sev}</span>'
+                f'<div class="sbar-wrap"><div class="sbar" style="width:{w}px;background:{color}"></div></div>'
+                f'<span class="scnt" style="color:{color}">{cnt}</span>'
+                f'</div>'
+            )
+
+    svc_html = (
+        "".join(f'<span class="chip">{s}</span>' for s in active)
+        or "<em>None detected</em>"
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ROT05 Report — {config.ip or 'Unknown'}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;line-height:1.6;padding:2rem}}
+a{{color:#63b3ed}}a:hover{{text-decoration:underline}}
+.page{{max-width:960px;margin:0 auto}}
+.hdr{{background:linear-gradient(135deg,#1a1f2e,#2d3748);border-radius:12px;padding:2rem;margin-bottom:2rem;border:1px solid #2d3748}}
+.hdr h1{{font-size:1.8rem;color:#f7fafc}}.hdr h1 span{{color:#e53e3e}}
+.meta{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-top:1.5rem}}
+.mc{{background:#1a202c;border-radius:8px;padding:1rem;border:1px solid #2d3748}}
+.mc .lbl{{font-size:.72rem;color:#718096;text-transform:uppercase;letter-spacing:.05em}}
+.mc .val{{font-size:.95rem;color:#f7fafc;margin-top:.2rem;word-break:break-all}}
+.sec{{margin-bottom:2rem}}
+.sec-title{{font-size:1rem;font-weight:600;color:#a0aec0;text-transform:uppercase;letter-spacing:.08em;margin-bottom:1rem;padding-bottom:.4rem;border-bottom:1px solid #2d3748}}
+.box{{background:#1a202c;border-radius:8px;padding:1.5rem;border:1px solid #2d3748}}
+.srow{{display:flex;align-items:center;gap:1rem;margin-bottom:.55rem}}
+.slbl{{width:70px;font-size:.83rem;font-weight:600}}
+.sbar-wrap{{flex:1;background:#2d3748;border-radius:4px;height:16px}}
+.sbar{{height:16px;border-radius:4px;min-width:4px}}
+.scnt{{width:28px;text-align:right;font-weight:700;font-size:.9rem}}
+.chip{{display:inline-block;background:#2d3748;border-radius:4px;padding:.2rem .55rem;font-size:.78rem;margin:.2rem;color:#90cdf4}}
+.card{{background:#1a202c;border-radius:8px;margin-bottom:1rem;border:1px solid #2d3748;overflow:hidden}}
+.card-hdr{{display:flex;align-items:center;gap:.65rem;padding:.9rem 1.2rem;background:#1e2535}}
+.badge{{font-size:.68rem;font-weight:700;padding:.18rem .55rem;border-radius:4px;color:#fff;white-space:nowrap}}
+.card-title{{font-weight:600;font-size:.97rem;flex:1}}
+.mitre{{font-size:.68rem;background:#2d3748;color:#a0aec0;padding:.18rem .45rem;border-radius:4px;white-space:nowrap}}
+.card-body{{padding:1.2rem}}
+.desc{{color:#a0aec0;margin-bottom:.9rem;font-size:.88rem}}
+.evid{{font-size:.78rem;color:#718096;font-style:italic;margin-bottom:.9rem;background:#171923;padding:.45rem .7rem;border-radius:4px;border-left:3px solid #2d3748}}
+h4{{font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;color:#718096;margin-bottom:.45rem}}
+.rlist{{padding-left:1.2rem;font-size:.86rem;color:#cbd5e0}}
+.rlist li{{margin-bottom:.35rem}}
+.refs{{margin-top:.9rem}}
+.ref{{font-size:.76rem;display:block;color:#63b3ed;margin:.12rem 0}}
+.empty{{background:#1a202c;border-radius:8px;padding:2rem;text-align:center;color:#68d391;border:1px solid #2f855a}}
+table{{width:100%;border-collapse:collapse;font-size:.78rem}}
+th{{background:#2d3748;color:#a0aec0;text-align:left;padding:.45rem .7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em}}
+td{{padding:.4rem .7rem;border-bottom:1px solid #2d3748;color:#a0aec0}}
+tr:hover td{{background:#1e2535}}
+.mono{{font-family:monospace;font-size:.73rem}}
+.foot{{text-align:center;color:#4a5568;font-size:.75rem;margin-top:2rem;padding-top:1rem;border-top:1px solid #2d3748}}
+@media print{{body{{background:#fff;color:#000}}.hdr,.card,.box{{background:#f7fafc;border-color:#e2e8f0}}.card-hdr{{background:#edf2f7}}a{{color:#2b6cb0}}}}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="hdr">
+  <h1><span>ROT05</span> Penetration Test Report</h1>
+  <div class="meta">
+    <div class="mc"><div class="lbl">Target</div><div class="val">{config.ip or '—'}</div></div>
+    <div class="mc"><div class="lbl">Domain</div><div class="val">{config.domain or '—'}</div></div>
+    <div class="mc"><div class="lbl">Assessor</div><div class="val">{config.username or '—'}</div></div>
+    <div class="mc"><div class="lbl">Generated</div><div class="val">{now}</div></div>
+    <div class="mc"><div class="lbl">Total Findings</div><div class="val">{len(findings)}</div></div>
+  </div>
+</div>
+
+<div class="sec">
+  <div class="sec-title">Detected Services</div>
+  <div class="box">{svc_html}</div>
+</div>
+
+<div class="sec">
+  <div class="sec-title">Finding Summary</div>
+  <div class="box">
+    {bars or '<p style="color:#68d391">No findings detected.</p>'}
+  </div>
+</div>
+
+<div class="sec">
+  <div class="sec-title">Findings &amp; Remediation</div>
+  {cards or '<div class="empty">No critical findings detected during this assessment.</div>'}
+</div>
+
+<div class="sec">
+  <div class="sec-title">Evidence Integrity (SHA-256)</div>
+  <div class="box" style="padding:0;overflow:auto">
+    <table>
+      <thead><tr><th>File</th><th>Bytes</th><th>SHA-256 (first 16 chars)</th></tr></thead>
+      <tbody>{ev_rows or '<tr><td colspan="3" style="text-align:center">No output files found</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+
+<div class="foot">
+  Generated by ROT05 — Authorized penetration testing only. CONFIDENTIAL.
+</div>
+
+</div>
+</body>
+</html>"""
+
+    out_path.write_text(html, encoding="utf-8")
+    success(f"HTML report → {out_path}")
+    return out_path
+
+
+def generate_pdf_report(html_path: Path) -> Optional[Path]:
+    """Convert the HTML report to PDF using WeasyPrint. Returns path or None."""
+    try:
+        from weasyprint import HTML as _WH
+    except ImportError:
+        warn("weasyprint not installed — PDF skipped.  pip install weasyprint")
+        return None
+    out_path = html_path.with_suffix(".pdf")
+    try:
+        _WH(filename=str(html_path)).write_pdf(str(out_path))
+        success(f"PDF report  → {out_path}")
+        return out_path
+    except Exception as exc:
+        err(f"PDF generation failed: {exc}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REPORT  (TXT + HTML + PDF)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_report():
-    title("Generating Report")
+    title("Generating Reports")
+    findings    = _collect_findings()
     report_file = ensure_dir() / "REPORT.txt"
     services    = detect_services(config.ip) if config.ip else {}
 
+    # ── Plain-text report (always generated) ────────────────────────────────
     lines = [
         "ROT05 Assessment Report",
         "=" * 60,
         f"Target:    {config.ip}",
         f"Domain:    {config.domain}",
         f"Timestamp: {datetime.datetime.now()}",
+        f"Findings:  {len(findings)} total",
         "=" * 60,
         "",
         "DETECTED SERVICES:",
@@ -1136,34 +1648,36 @@ def generate_report():
         "",
         "FINDINGS:",
     ]
+    for f in findings:
+        lines.append(f"  [{f['severity']:8s}] {f['title']}")
+        if f.get("mitre"):
+            lines.append(f"               MITRE: {f['mitre']}")
+    if not findings:
+        lines.append("  No critical findings detected")
 
-    findings = []
-    for label, path in [
-        ("Kerberoastable accounts", OUTPUT_DIR / "kerberoast" / "hashes.txt"),
-        ("AS-REP roastable accounts", OUTPUT_DIR / "asrep"    / "hashes.txt"),
-    ]:
-        if path.exists() and path.stat().st_size > 0:
-            findings.append(f"  • {label}")
+    lines += ["", "REMEDIATION SUMMARY:"]
+    for f in findings:
+        lines += ["", f"[{f['severity']}] {f['title']}", f['description'], ""]
+        for i, r in enumerate(f["remediation"], 1):
+            lines.append(f"  {i}. {r}")
+        if f["references"]:
+            lines.append(f"  References: {', '.join(f['references'])}")
 
-    cpass = OUTPUT_DIR / "gpo" / "cpassword_results.txt"
-    if cpass.exists() and "cpassword" in cpass.read_text().lower():
-        findings.append("  • cPassword in SYSVOL")
-
-    lines += findings if findings else ["  No critical findings yet"]
-
-    # FIX: SHA256 integrity hashes wired into report
     lines += ["", "OUTPUT FILES (SHA256):"]
     for subdir in sorted(OUTPUT_DIR.iterdir()):
         if subdir.is_dir():
             lines.append(f"\n[{subdir.name.upper()}]")
-            for f in sorted(subdir.iterdir()):
-                if f.is_file():
-                    sha = calculate_file_hash(f)
-                    lines.append(f"  {f.name:<40s}  {sha}")
-
+            for fp in sorted(subdir.iterdir()):
+                if fp.is_file():
+                    sha = calculate_file_hash(fp)
+                    lines.append(f"  {fp.name:<40s}  {sha}")
     lines += ["", "=" * 60]
     report_file.write_text("\n".join(lines))
-    success(f"Report → {report_file}")
+    success(f"TXT report  → {report_file}")
+
+    # ── HTML + PDF ──────────────────────────────────────────────────────────
+    html_path = generate_html_report(findings)
+    generate_pdf_report(html_path)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INTERACTIVE SHELL

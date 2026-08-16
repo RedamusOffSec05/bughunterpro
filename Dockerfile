@@ -46,6 +46,12 @@ RUN apt-get update && \
         ripgrep \
         tmux \
         vim \
+        # WeasyPrint PDF rendering system libs
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libcairo2 \
+        libgdk-pixbuf2.0-0 \
+        libffi-dev \
     && apt-get autoremove -y \
     && apt-get autoclean \
     && rm -rf /var/lib/apt/lists/*
@@ -81,6 +87,9 @@ RUN pip3 install --break-system-packages \
 # netexec (successor to crackmapexec) — fall back to cme if netexec unavailable
 RUN pip3 install --break-system-packages netexec 2>/dev/null || \
     pip3 install --break-system-packages crackmapexec 2>/dev/null || true
+
+# WeasyPrint — HTML-to-PDF for the assessment report
+RUN pip3 install --break-system-packages weasyprint>=60.0
 
 # ── windapsearch ──────────────────────────────────────────────────────────────
 RUN git clone --depth=1 https://github.com/ropnop/windapsearch.git /opt/windapsearch && \

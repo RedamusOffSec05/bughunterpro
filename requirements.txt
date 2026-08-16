@@ -13,3 +13,8 @@ dnspython>=2.3.0
 
 # ── Optional: AD CS attacks ──────────────────────────────────────────────────
 # certipy-ad>=4.0.0
+
+# ── Reporting (HTML→PDF) ─────────────────────────────────────────────────────
+# Requires system libs: libpango-1.0-0 libpangocairo-1.0-0 libcairo2
+# Install in Docker via apt; on Kali/Debian: apt install python3-weasyprint
+weasyprint>=60.0
