@@ -1675,9 +1675,419 @@ def generate_report():
     report_file.write_text("\n".join(lines))
     success(f"TXT report  → {report_file}")
 
-    # ── HTML + PDF ──────────────────────────────────────────────────────────
+    # ── HTML + PDF + Dashboard ───────────────────────────────────────────────
     html_path = generate_html_report(findings)
     generate_pdf_report(html_path)
+    generate_dashboard(findings)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DASHBOARD  — interactive HTML app baked with real scan data
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_nmap_xml(xml_path: Path) -> List[Dict]:
+    """Parse an nmap XML file into a list of port dicts."""
+    import xml.etree.ElementTree as ET
+    ports = []
+    try:
+        tree = ET.parse(xml_path)
+        for port_el in tree.findall(".//port"):
+            state_el   = port_el.find("state")
+            service_el = port_el.find("service")
+            state = state_el.attrib.get("state", "unknown") if state_el is not None else "unknown"
+            svc   = service_el.attrib.get("name", "") if service_el is not None else ""
+            ver   = ""
+            if service_el is not None:
+                parts = [service_el.attrib.get(k, "") for k in ("product", "version", "extrainfo")]
+                ver   = " ".join(p for p in parts if p).strip()
+            ports.append({
+                "p":   int(port_el.attrib.get("portid", 0)),
+                "pr":  port_el.attrib.get("protocol", "tcp"),
+                "st":  state,
+                "svc": svc,
+                "ver": ver,
+                "cves": [],
+            })
+    except Exception:
+        pass
+    return ports
+
+
+def _parse_nmap_txt(txt_path: Path) -> List[Dict]:
+    """Fallback: parse plain nmap text output for open ports."""
+    ports = []
+    if not txt_path.exists():
+        return ports
+    for line in txt_path.read_text(errors="replace").splitlines():
+        m = re.match(r"(\d+)/(tcp|udp)\s+(open|closed|filtered)\s+(\S+)?\s*(.*)", line.strip())
+        if m:
+            ports.append({
+                "p":   int(m.group(1)),
+                "pr":  m.group(2),
+                "st":  m.group(3),
+                "svc": (m.group(4) or "").strip(),
+                "ver": (m.group(5) or "").strip(),
+                "cves": [],
+            })
+    return ports
+
+
+def _nmap_raw_text() -> str:
+    """Return the first available nmap plain-text log."""
+    for candidate in ("services.log", "all-ports.log"):
+        p = OUTPUT_DIR / "nmap" / candidate
+        if p.exists():
+            return p.read_text(errors="replace")
+    return "(no nmap output available)"
+
+
+def _detect_cves_from_smb_output() -> List[str]:
+    """Check smb-scripts output for known CVE markers."""
+    cves = []
+    f = OUTPUT_DIR / "nmap" / "smb-scripts.log"
+    if f.exists():
+        text = f.read_text(errors="replace").lower()
+        if "ms17-010" in text or "eternalblue" in text:
+            cves.append("MS17-010")
+        if "ms08-067" in text:
+            cves.append("MS08-067")
+    return cves
+
+
+def generate_dashboard(findings: List[Dict]) -> Path:
+    """Generate a standalone interactive HTML dashboard from real scan data."""
+    out_path = ensure_dir() / "DASHBOARD.html"
+    now      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Collect ports from nmap XML or text fallback ─────────────────────
+    nmap_dir  = OUTPUT_DIR / "nmap"
+    ports: List[Dict] = []
+    for xml_name in ("services.xml", "all-ports.xml"):
+        xml_path = nmap_dir / xml_name
+        if xml_path.exists():
+            ports = _parse_nmap_xml(xml_path)
+            break
+    if not ports:
+        for txt_name in ("services.log", "all-ports.log"):
+            ports = _parse_nmap_txt(nmap_dir / txt_name)
+            if ports:
+                break
+
+    # Mark CVEs on port 445
+    smb_cves = _detect_cves_from_smb_output()
+    for pt in ports:
+        if pt["p"] == 445 and smb_cves:
+            pt["cves"] = smb_cves
+
+    nmap_raw = _nmap_raw_text()
+
+    # ── Build JS data payload ─────────────────────────────────────────────
+    host_js = json.dumps({
+        "ip":       config.ip or "—",
+        "host":     config.domain or "—",
+        "os":       "Windows (detected)",
+        "icon":     "🖥",
+        "ports":    ports,
+        "findings": [
+            {
+                "sev":   f["severity"].lower(),
+                "title": f["title"],
+                "mitre": f.get("mitre", ""),
+                "desc":  f["description"],
+                "remed": f["remediation"],
+            }
+            for f in findings
+        ],
+        "trace":    [],
+        "dets":     {
+            "Target IP":   config.ip or "—",
+            "Domain":      config.domain or "—",
+            "Username":    config.username or "—",
+            "Scan date":   now,
+            "Output dir":  str(OUTPUT_DIR),
+        },
+        "nmap": nmap_raw,
+    }, ensure_ascii=False)
+
+    # ── Embed into dashboard HTML ─────────────────────────────────────────
+    dashboard_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ROT05 Intel — {config.ip or 'scan'}</title>
+<style>
+:root{{
+  --bg:#EEF1F8;--surface:#fff;--surface2:#F4F6FC;--border:#D8DEEE;
+  --accent:#0066CC;--accent-dim:rgba(0,102,204,.1);
+  --txt:#131928;--txt2:#4B5572;--txt3:#8E97B4;
+  --open:#0D9F56;--open-bg:rgba(13,159,86,.09);
+  --closed:#C53030;--filtered:#B45309;
+  --crit:#C53030;--high:#C05621;--medium:#92680E;--low:#1E5FAD;
+  --shadow:0 1px 3px rgba(0,0,0,.07);--led-glow:none;
+}}
+@media(prefers-color-scheme:dark){{
+  :root:not([data-theme="light"]){{
+    --bg:#0C0E14;--surface:#12151F;--surface2:#1A1E2B;--border:#252A3A;
+    --accent:#00D4FF;--accent-dim:rgba(0,212,255,.09);
+    --txt:#E8EBF4;--txt2:#8B91A7;--txt3:#464E68;
+    --open:#00E676;--open-bg:rgba(0,230,118,.07);
+    --closed:#FF4545;--filtered:#FF8C00;
+    --crit:#FF4545;--high:#FF8C00;--medium:#FFB800;--low:#60A5FA;
+    --shadow:0 2px 12px rgba(0,0,0,.5);--led-glow:0 0 6px currentColor;
+  }}
+}}
+:root[data-theme="dark"]{{
+  --bg:#0C0E14;--surface:#12151F;--surface2:#1A1E2B;--border:#252A3A;
+  --accent:#00D4FF;--accent-dim:rgba(0,212,255,.09);
+  --txt:#E8EBF4;--txt2:#8B91A7;--txt3:#464E68;
+  --open:#00E676;--open-bg:rgba(0,230,118,.07);
+  --closed:#FF4545;--filtered:#FF8C00;
+  --crit:#FF4545;--high:#FF8C00;--medium:#FFB800;--low:#60A5FA;
+  --shadow:0 2px 12px rgba(0,0,0,.5);--led-glow:0 0 6px currentColor;
+}}
+:root[data-theme="light"]{{
+  --bg:#EEF1F8;--surface:#fff;--surface2:#F4F6FC;--border:#D8DEEE;
+  --accent:#0066CC;--accent-dim:rgba(0,102,204,.1);
+  --txt:#131928;--txt2:#4B5572;--txt3:#8E97B4;
+  --open:#0D9F56;--open-bg:rgba(13,159,86,.09);
+  --closed:#C53030;--filtered:#B45309;
+  --crit:#C53030;--high:#C05621;--medium:#92680E;--low:#1E5FAD;
+  --shadow:0 1px 3px rgba(0,0,0,.07);--led-glow:none;
+}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+html,body{{height:100%;overflow:hidden}}
+body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--txt);font-size:13px;display:flex;flex-direction:column;line-height:1.4}}
+button{{font-family:inherit;font-size:inherit}}
+:focus-visible{{outline:2px solid var(--accent);outline-offset:2px}}
+@media(prefers-reduced-motion:reduce){{*{{animation-duration:.01ms!important;transition-duration:.01ms!important}}}}
+.topbar{{display:flex;align-items:center;gap:8px;height:42px;padding:0 14px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;z-index:10}}
+.logo{{font-family:'Courier New',monospace;font-size:13px;font-weight:700;letter-spacing:.06em;color:var(--accent);margin-right:6px}}
+.logo em{{color:var(--txt3);font-style:normal;font-weight:400}}
+.pill{{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border:1px solid var(--border);border-radius:4px;font-family:'Courier New',monospace;font-size:11px;color:var(--txt2);background:var(--surface2);white-space:nowrap}}
+.pill.target{{font-weight:700;color:var(--txt)}}
+.dot-led{{width:7px;height:7px;border-radius:50%;background:var(--open);flex-shrink:0}}
+.spacer{{flex:1}}
+.clock{{font-family:'Courier New',monospace;font-size:11px;color:var(--txt3);font-variant-numeric:tabular-nums;letter-spacing:.04em}}
+.theme-btn{{background:none;border:1px solid var(--border);border-radius:4px;color:var(--txt3);cursor:pointer;padding:3px 9px;font-size:11px;transition:color .15s,border-color .15s}}
+.theme-btn:hover{{color:var(--txt);border-color:var(--accent)}}
+.layout{{display:grid;grid-template-columns:198px 1fr;flex:1;overflow:hidden}}
+.sidebar{{display:flex;flex-direction:column;background:var(--surface);border-right:1px solid var(--border);overflow:hidden}}
+.sidebar-head{{padding:9px 12px 7px;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--txt3);border-bottom:1px solid var(--border);flex-shrink:0}}
+.host-list{{overflow-y:auto;flex:1}}
+.host-item{{display:flex;align-items:center;gap:9px;padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .1s}}
+.host-item:hover{{background:var(--surface2)}}
+.host-item.active{{background:var(--accent-dim);border-left:3px solid var(--accent);padding-left:9px}}
+.h-icon{{width:28px;height:28px;border-radius:5px;background:var(--surface2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}}
+.h-info{{flex:1;min-width:0}}
+.h-ip{{font-family:'Courier New',monospace;font-size:11.5px;font-weight:700;color:var(--txt)}}
+.h-name{{font-size:10px;color:var(--txt3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.h-badge{{flex-shrink:0;font-size:9px;font-weight:800;padding:1px 5px;border-radius:3px;color:#fff;background:var(--crit)}}
+.h-badge.warn{{background:var(--high)}}.h-badge.ok{{background:var(--open)}}
+.sidebar-foot{{padding:8px 12px;font-size:10px;color:var(--txt3);border-top:1px solid var(--border);line-height:1.6;flex-shrink:0}}
+.main{{display:flex;flex-direction:column;overflow:hidden}}
+.tgt-strip{{display:flex;align-items:center;gap:10px;padding:7px 14px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}}
+.tgt-lbl{{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--txt3)}}
+.tgt-ip{{font-family:'Courier New',monospace;font-weight:700;font-size:15px;color:var(--accent);letter-spacing:.03em}}
+.tgt-host{{color:var(--txt2);font-size:12px}}
+.tgt-os{{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;font-size:11px;color:var(--txt2);background:var(--surface2)}}
+.vbar{{width:1px;height:16px;background:var(--border);margin:0 2px}}
+.tgt-meta{{font-size:11px;color:var(--txt3)}}
+.scan-ts{{margin-left:auto;font-family:'Courier New',monospace;font-size:10px;color:var(--txt3);white-space:nowrap}}
+.portmap-wrap{{padding:7px 14px 8px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}}
+.portmap-lbl{{font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--txt3);font-weight:600;margin-bottom:5px}}
+#portCanvas{{display:block;width:100%;height:24px;border-radius:3px;cursor:crosshair}}
+.tabs{{display:flex;align-items:stretch;padding:0 14px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;gap:0;overflow-x:auto}}
+.tab{{padding:9px 13px;font-size:12px;color:var(--txt2);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;user-select:none;transition:color .12s;display:flex;align-items:center;gap:5px}}
+.tab:hover{{color:var(--txt)}}.tab.active{{color:var(--accent);border-bottom-color:var(--accent)}}
+.tab-n{{min-width:17px;height:15px;display:inline-flex;align-items:center;justify-content:center;padding:0 4px;border-radius:3px;font-size:9px;font-weight:700;background:var(--surface2);border:1px solid var(--border);color:var(--txt3)}}
+.tab.active .tab-n{{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}}
+.pane{{display:none;flex:1;flex-direction:column;overflow:hidden}}.pane.on{{display:flex}}
+.toolbar{{display:flex;align-items:center;gap:7px;padding:7px 14px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0}}
+.search{{display:flex;align-items:center;gap:5px;padding:4px 9px;border:1px solid var(--border);border-radius:4px;background:var(--surface2);width:210px}}
+.search input{{background:none;border:none;outline:none;color:var(--txt);font-size:12px;font-family:'Courier New',monospace;width:100%}}
+.search input::placeholder{{color:var(--txt3)}}
+.chip{{padding:3px 9px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--txt2);cursor:pointer;background:var(--surface);transition:all .1s;user-select:none}}
+.chip:hover{{border-color:var(--accent);color:var(--accent)}}.chip.on{{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}}
+.tbl-wrap{{overflow:auto;flex:1}}
+table{{width:100%;border-collapse:collapse}}
+thead{{position:sticky;top:0;z-index:1}}
+th{{background:var(--surface);border-bottom:2px solid var(--border);padding:7px 12px;font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--txt3);text-align:left;white-space:nowrap}}
+th:first-child{{padding-left:14px}}
+td{{padding:7px 12px;border-bottom:1px solid var(--border);color:var(--txt2);vertical-align:middle}}
+td:first-child{{padding-left:14px}}
+tr:hover td{{background:var(--surface2)}}
+.portnum{{font-family:'Courier New',monospace;font-weight:700;font-size:12px;color:var(--txt);font-variant-numeric:tabular-nums}}
+.state{{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600}}
+.led{{width:7px;height:7px;border-radius:50%;flex-shrink:0}}
+.state.open{{color:var(--open)}}.state.closed{{color:var(--closed)}}.state.filtered{{color:var(--filtered)}}
+.led.open{{background:var(--open);box-shadow:var(--led-glow)}}.led.closed{{background:var(--closed)}}.led.filtered{{background:var(--filtered)}}
+.svcname{{font-weight:600;color:var(--txt);font-size:12px}}
+.verstr{{font-family:'Courier New',monospace;font-size:11px;color:var(--txt2)}}
+.cvebadge{{font-family:'Courier New',monospace;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:rgba(197,48,48,.12);border:1px solid rgba(197,48,48,.32);color:var(--crit);margin-left:5px}}
+.svc-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:10px;padding:14px;overflow:auto;flex:1;align-content:start}}
+.svc-card{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:11px 13px;transition:border-color .12s}}
+.svc-card:hover{{border-color:var(--accent)}}
+.sc-port{{font-family:'Courier New',monospace;font-size:10.5px;color:var(--txt3);margin-bottom:3px}}
+.sc-name{{font-weight:700;font-size:13px;color:var(--txt);margin-bottom:2px}}
+.sc-ver{{font-family:'Courier New',monospace;font-size:10.5px;color:var(--txt2);line-height:1.4}}
+.sc-tag{{display:inline-block;margin-top:7px;font-size:9.5px;font-weight:700;padding:2px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em}}
+.sc-tag.crit{{background:rgba(197,48,48,.11);color:var(--crit)}}.sc-tag.warn{{background:rgba(144,104,14,.12);color:var(--medium)}}.sc-tag.ok{{background:var(--open-bg);color:var(--open)}}
+.nmap-out{{flex:1;overflow:auto;padding:14px}}
+.nmap-pre{{font-family:'Courier New',Courier,monospace;font-size:12px;line-height:1.7;color:var(--txt2);white-space:pre}}
+.nmap-pre .hi{{color:var(--txt);font-weight:600}}.nmap-pre .open{{color:var(--open)}}.nmap-pre .close{{color:var(--closed)}}.nmap-pre .sec{{color:var(--accent);font-weight:600}}.nmap-pre .warn{{color:var(--medium)}}.nmap-pre .vuln{{color:var(--crit)}}
+.findings{{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:9px}}
+.fc{{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden}}
+.fc-header{{display:flex;align-items:center;gap:9px;padding:10px 13px;cursor:pointer;user-select:none}}
+.fc-header:hover{{background:var(--surface2)}}
+.sev{{font-size:9.5px;font-weight:800;padding:2px 7px;border-radius:3px;color:#fff;text-transform:uppercase;letter-spacing:.05em;flex-shrink:0}}
+.sev.critical{{background:var(--crit)}}.sev.high{{background:var(--high)}}.sev.medium{{background:var(--medium);color:#1a1000}}.sev.low{{background:var(--low)}}
+.fc-title{{font-weight:600;font-size:13px;color:var(--txt);flex:1}}
+.mitre{{font-family:'Courier New',monospace;font-size:10px;padding:2px 6px;background:var(--surface2);border:1px solid var(--border);border-radius:3px;color:var(--txt3);flex-shrink:0}}
+.chevron{{font-size:11px;color:var(--txt3);transition:transform .15s;flex-shrink:0}}
+.chevron.open{{transform:rotate(180deg)}}
+.fc-body{{border-top:1px solid var(--border);padding:12px 13px;display:none}}
+.fc-body.open{{display:block}}
+.fc-desc{{color:var(--txt2);font-size:12px;margin-bottom:10px;line-height:1.6}}
+.remed-lbl{{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--txt3);margin-bottom:7px}}
+.remed ol{{padding-left:15px}}.remed li{{font-size:12px;color:var(--txt2);margin-bottom:5px;line-height:1.55}}.remed li::marker{{color:var(--accent)}}
+.det-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:14px;overflow:auto;flex:1;align-content:start}}
+.det-block{{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:11px 13px}}
+.det-block.wide{{grid-column:1/-1}}
+.det-lbl{{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--txt3);margin-bottom:9px}}
+.det-row{{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px}}
+.det-row:last-child{{border-bottom:none}}
+.det-key{{color:var(--txt2)}}.det-val{{font-family:'Courier New',monospace;font-size:11px;color:var(--txt);text-align:right}}
+.sbar{{display:flex;align-items:center;gap:14px;padding:4px 14px;background:var(--surface);border-top:1px solid var(--border);font-size:11px;flex-shrink:0}}
+.si{{display:flex;align-items:center;gap:5px;color:var(--txt3)}}.si .d{{width:6px;height:6px;border-radius:50%}}
+.si.crit .d{{background:var(--crit)}}.si.high .d{{background:var(--high)}}.si.med .d{{background:var(--medium)}}.si.ok .d{{background:var(--open)}}
+::-webkit-scrollbar{{width:5px;height:5px}}::-webkit-scrollbar-track{{background:var(--surface)}}::-webkit-scrollbar-thumb{{background:var(--border);border-radius:3px}}::-webkit-scrollbar-thumb:hover{{background:var(--txt3)}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <span class="logo">ROT05<em> intel</em></span>
+  <div class="pill target"><span class="dot-led"></span>{config.ip or '—'}</div>
+  <div class="pill">Assessment Report</div>
+  <div class="pill"><span class="dot-led"></span>Complete — {now}</div>
+  <div class="spacer"></div>
+  <span class="clock" id="clk">—</span>
+  <button class="theme-btn" onclick="toggleTheme()">◑ Theme</button>
+</div>
+<div class="layout">
+<aside class="sidebar">
+  <div class="sidebar-head">Hosts (1)</div>
+  <div class="host-list" id="host-list"></div>
+  <div class="sidebar-foot">Output: {OUTPUT_DIR}<br>Generated: {now}</div>
+</aside>
+<div class="main">
+  <div class="tgt-strip">
+    <span class="tgt-lbl">Target</span>
+    <span class="tgt-ip" id="t-ip">—</span>
+    <span class="tgt-host" id="t-host">—</span>
+    <span class="tgt-os" id="t-os">—</span>
+    <div class="vbar"></div>
+    <span class="tgt-meta" id="t-ports">—</span>
+    <span class="scan-ts">{now}</span>
+  </div>
+  <div class="portmap-wrap">
+    <div class="portmap-lbl">Port density — 0 → 65535</div>
+    <canvas id="portCanvas"></canvas>
+  </div>
+  <div class="tabs" role="tablist">
+    <div class="tab active" onclick="switchTab('ports')" role="tab">Ports / Hosts<span class="tab-n" id="tn-ports">0</span></div>
+    <div class="tab" onclick="switchTab('services')" role="tab">Services</div>
+    <div class="tab" onclick="switchTab('nmap')" role="tab">Nmap Output</div>
+    <div class="tab" onclick="switchTab('findings')" role="tab">Findings<span class="tab-n" id="tn-findings">0</span></div>
+    <div class="tab" onclick="switchTab('details')" role="tab">Host Details</div>
+  </div>
+  <div class="pane on" id="pane-ports">
+    <div class="toolbar">
+      <div class="search"><input id="psearch" type="text" placeholder="port, service, version…" oninput="filterPorts(this.value)" spellcheck="false"/></div>
+      <div class="chip on" onclick="setFilter(this,'all')">All</div>
+      <div class="chip" onclick="setFilter(this,'open')">Open</div>
+      <div class="chip" onclick="setFilter(this,'closed')">Closed</div>
+      <div class="chip" onclick="setFilter(this,'filtered')">Filtered</div>
+    </div>
+    <div class="tbl-wrap"><table><thead><tr>
+      <th>Port</th><th>State</th><th>Proto</th><th>Service</th><th>Version</th><th>Flags</th>
+    </tr></thead><tbody id="port-tbody"></tbody></table></div>
+  </div>
+  <div class="pane" id="pane-services"><div class="svc-grid" id="svc-grid"></div></div>
+  <div class="pane" id="pane-nmap"><div class="nmap-out"><pre class="nmap-pre" id="nmap-pre"></pre></div></div>
+  <div class="pane" id="pane-findings"><div class="findings" id="findings-list"></div></div>
+  <div class="pane" id="pane-details"><div class="det-grid" id="det-grid"></div></div>
+</div>
+</div>
+<div class="sbar">
+  <div class="si crit"><div class="d"></div><span id="sb-crit">—</span></div>
+  <div class="si high"><div class="d"></div><span id="sb-high">—</span></div>
+  <div class="si med"><div class="d"></div><span id="sb-med">—</span></div>
+  <div class="si ok"><div class="d"></div><span id="sb-ok">—</span></div>
+  <span style="margin-left:auto;color:var(--txt3)">ROT05 Assessment Dashboard</span>
+</div>
+<script>
+const H={host_js};
+const SVC_RISK={{'ssh':'ok','domain':'warn','http':'warn','kerberos-sec':'warn','msrpc':'ok','netbios-ssn':'warn','ldap':'warn','ssl/http':'ok','microsoft-ds':'crit','kpasswd5':'ok','ncacn_http':'ok','ldapssl':'ok','msft-gc':'ok','globalcatLDAPssl':'ok','ms-wbt-server':'warn','http-proxy':'warn','ssl/https':'ok'}};
+const SVC_LBL={{ok:'Standard',warn:'Review',crit:'Attention'}};
+let tab='ports',pf='all',ps='';
+function switchTab(n){{tab=n;document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',['ports','services','nmap','findings','details'][i]===n));document.querySelectorAll('.pane').forEach(el=>el.classList.remove('on'));document.getElementById('pane-'+n).classList.add('on');}}
+function toggleTheme(){{const r=document.documentElement;r.setAttribute('data-theme',r.getAttribute('data-theme')==='dark'?'light':'dark');setTimeout(drawMap,30);}}
+function buildHostList(){{document.getElementById('host-list').innerHTML=`<div class="host-item active"><div class="h-icon">${{H.icon}}</div><div class="h-info"><div class="h-ip">${{H.ip}}</div><div class="h-name">${{H.host}}</div></div>${{H.findings.length?`<span class="h-badge ${{H.findings.some(f=>f.sev==='critical')?'':'warn'}}">${{H.findings.length}}</span>`:'<span class="h-badge ok">✓</span>'}}</div>`;}}
+function render(){{
+  document.getElementById('t-ip').textContent=H.ip;
+  document.getElementById('t-host').textContent=H.host;
+  document.getElementById('t-os').textContent=H.os;
+  const open=H.ports.filter(p=>p.st==='open').length;
+  document.getElementById('t-ports').textContent=open+' open ports';
+  document.getElementById('tn-ports').textContent=open;
+  document.getElementById('tn-findings').textContent=H.findings.length;
+  const crit=H.findings.filter(f=>f.sev==='critical').length;
+  const high=H.findings.filter(f=>f.sev==='high').length;
+  const med=H.findings.filter(f=>f.sev==='medium').length;
+  document.getElementById('sb-crit').textContent=crit+' Critical';
+  document.getElementById('sb-high').textContent=high+' High';
+  document.getElementById('sb-med').textContent=med+' Medium';
+  document.getElementById('sb-ok').textContent=open+' open ports';
+  renderPorts();renderServices();renderNmap();renderFindings();renderDetails();drawMap();
+}}
+function renderPorts(){{
+  const q=ps.toLowerCase();
+  const rows=H.ports.filter(p=>{{if(pf!=='all'&&p.st!==pf)return false;if(q&&!String(p.p).includes(q)&&!p.svc.includes(q)&&!p.ver.toLowerCase().includes(q))return false;return true;}});
+  document.getElementById('port-tbody').innerHTML=rows.map(p=>{{const cves=p.cves.map(c=>`<span class="cvebadge">${{c}}</span>`).join('');return`<tr><td><span class="portnum">${{p.p}}/${{p.pr}}</span></td><td><span class="state ${{p.st}}"><span class="led ${{p.st}}"></span>${{p.st}}</span></td><td style="font-size:11px;color:var(--txt3)">${{p.pr.toUpperCase()}}</td><td><span class="svcname">${{p.svc}}</span></td><td><span class="verstr">${{p.ver||'—'}}</span>${{cves}}</td><td></td></tr>`;}}). join('');
+}}
+function filterPorts(v){{ps=v;renderPorts();}}
+function setFilter(el,f){{document.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');pf=f;renderPorts();}}
+function renderServices(){{document.getElementById('svc-grid').innerHTML=H.ports.filter(p=>p.st==='open').map(p=>{{const r=SVC_RISK[p.svc]||'ok';return`<div class="svc-card"><div class="sc-port">${{p.p}}/${{p.pr}}</div><div class="sc-name">${{p.svc}}</div><div class="sc-ver">${{p.ver||'Unknown version'}}</div><div class="sc-tag ${{r}}">${{SVC_LBL[r]}}</div></div>`;}}).join('');}}
+function esc(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+function renderNmap(){{document.getElementById('nmap-pre').innerHTML=H.nmap.split('\\n').map(l=>{{if(/open/.test(l)&&/\\/tcp/.test(l))return`<span class="open">${{esc(l)}}</span>`;if(/closed/.test(l)&&/\\/tcp/.test(l))return`<span class="close">${{esc(l)}}</span>`;if(/^(PORT|HOP)\\b/.test(l.trim()))return`<span class="sec">${{esc(l)}}</span>`;if(/VULNERABLE|Risk factor|CVE/i.test(l))return`<span class="vuln">${{esc(l)}}</span>`;if(/^(Starting Nmap|Nmap done|Nmap scan report)/.test(l))return`<span class="hi">${{esc(l)}}</span>`;return esc(l);}}).join('\\n');}}
+function renderFindings(){{const el=document.getElementById('findings-list');if(!H.findings.length){{el.innerHTML='<div style="text-align:center;padding:48px;color:var(--txt3)">No findings detected.</div>';return;}}el.innerHTML=H.findings.map((f,i)=>`<div class="fc"><div class="fc-header" onclick="toggleFc(${{i}})"><span class="sev ${{f.sev}}">${{f.sev}}</span><span class="fc-title">${{f.title}}</span><span class="mitre">${{f.mitre}}</span><span class="chevron" id="chev-${{i}}">▾</span></div><div class="fc-body" id="fcb-${{i}}"><p class="fc-desc">${{f.desc}}</p><div class="remed-lbl">Remediation Steps</div><div class="remed"><ol>${{f.remed.map(r=>`<li>${{r}}</li>`).join('')}}</ol></div></div></div>`).join('');}}
+function toggleFc(i){{document.getElementById('fcb-'+i).classList.toggle('open');document.getElementById('chev-'+i).classList.toggle('open');}}
+function renderDetails(){{document.getElementById('det-grid').innerHTML=`<div class="det-block wide"><div class="det-lbl">Scan Metadata</div>${{Object.entries(H.dets).map(([k,v])=>`<div class="det-row"><span class="det-key">${{k}}</span><span class="det-val">${{v}}</span></div>`).join('')}}</div>`;}}
+function drawMap(){{
+  const c=document.getElementById('portCanvas');const dpr=window.devicePixelRatio||1;const W=c.parentElement.clientWidth-28,H2=24;
+  c.width=W*dpr;c.height=H2*dpr;c.style.width=W+'px';c.style.height=H2+'px';
+  const ctx=c.getContext('2d');ctx.scale(dpr,dpr);
+  const cs=getComputedStyle(document.documentElement);
+  ctx.fillStyle=cs.getPropertyValue('--surface2').trim();ctx.fillRect(0,0,W,H2);
+  const openC=cs.getPropertyValue('--open').trim(),critC=cs.getPropertyValue('--crit').trim(),bdrC=cs.getPropertyValue('--border').trim();
+  ctx.strokeStyle=bdrC;ctx.lineWidth=1;ctx.setLineDash([2,3]);
+  [[1024],[32768]].forEach(([p])=>{{const x=(p/65535)*W;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H2);ctx.stroke();}});
+  ctx.setLineDash([]);
+  H.ports.filter(p=>p.st==='open').forEach(p=>{{const x=(p.p/65535)*W;ctx.fillStyle=p.cves.length?critC:openC;ctx.globalAlpha=.85;ctx.fillRect(Math.max(0,x-1.5),3,3.5,H2-6);}});
+  ctx.globalAlpha=1;
+  ctx.fillStyle=cs.getPropertyValue('--txt3').trim();ctx.font=`${{9*dpr}}px "Courier New",monospace`;ctx.scale(1/dpr,1/dpr);
+  ctx.fillText('0',2*dpr,(H2-3)*dpr);ctx.fillText('1024',(1024/65535*W-2)*dpr,(H2-3)*dpr);ctx.fillText('65535',(W-32)*dpr,(H2-3)*dpr);
+}}
+(function tick(){{document.getElementById('clk').textContent=new Date().toTimeString().slice(0,8);setTimeout(tick,1000);}})();
+buildHostList();render();window.addEventListener('resize',drawMap);
+</script>
+</body>
+</html>"""
+
+    out_path.write_text(dashboard_html, encoding="utf-8")
+    success(f"Dashboard   → {out_path}")
+    return out_path
 
 # ──────────────────────────────────────────────────────────────────────────────
 # INTERACTIVE SHELL
