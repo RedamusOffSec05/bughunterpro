@@ -9,7 +9,7 @@ class BugHunterPro:
     
     def hunt(self):
         print(f"[+] Hunting en {self.target}")
-        return {"subdomains": set(), "vulnerabilities": []}
+        return {"subdomains": [], "vulnerabilities": []}
 
 def main():
     parser = argparse.ArgumentParser(description="BugHunterPro")
