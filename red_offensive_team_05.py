@@ -1114,6 +1114,388 @@ class CVEScanner:
             success("No known vulnerabilities detected")
         return results
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODULE: BUG BOUNTY — SCOPE VALIDATOR
+# ──────────────────────────────────────────────────────────────────────────────
+
+import ipaddress as _ipaddress
+
+class ScopeValidator:
+    """Enforce program scope before every request.
+
+    Scope file (JSON or plain-text, one entry per line):
+      JSON:  {"domains": ["*.example.com", "api.example.com"],
+               "ips":     ["1.2.3.4"],
+               "cidrs":   ["10.0.0.0/24"]}
+      Text:  *.example.com
+             api.example.com
+             1.2.3.4
+             10.0.0.0/24
+    """
+
+    def __init__(self, scope_file: Optional[Path] = None):
+        self.domains:  List[str] = []   # plain or wildcard (*.example.com)
+        self.ips:      set       = set()
+        self.cidrs:    list      = []   # list of ipaddress.IPv4Network / IPv6Network
+        self._loaded: bool = False
+        if scope_file:
+            self._load(scope_file)
+
+    # ── loading ────────────────────────────────────────────────────────────────
+
+    def _load(self, path: Path) -> None:
+        raw = path.read_text(encoding="utf-8").strip()
+        try:
+            data = json.loads(raw)
+            for d in data.get("domains", []):
+                self._add_entry(d)
+            for i in data.get("ips", []):
+                self._add_entry(i)
+            for c in data.get("cidrs", []):
+                self._add_entry(c)
+        except json.JSONDecodeError:
+            for line in raw.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    self._add_entry(line)
+        self._loaded = True
+        info(f"Scope loaded: {len(self.domains)} domains, "
+             f"{len(self.ips)} IPs, {len(self.cidrs)} CIDRs")
+
+    def _add_entry(self, entry: str) -> None:
+        entry = entry.strip().lower()
+        if not entry:
+            return
+        try:
+            net = _ipaddress.ip_network(entry, strict=False)
+            if net.num_addresses == 1:
+                self.ips.add(str(net.network_address))
+            else:
+                self.cidrs.append(net)
+        except ValueError:
+            self.domains.append(entry)
+
+    def add_target(self, target: str) -> None:
+        """Convenience: add config.ip / config.domain at runtime."""
+        self._add_entry(target)
+
+    # ── validation ─────────────────────────────────────────────────────────────
+
+    def _domain_matches(self, target: str) -> bool:
+        target = target.lower().rstrip(".")
+        for pattern in self.domains:
+            if pattern.startswith("*."):
+                base = pattern[2:]
+                if target == base or target.endswith("." + base):
+                    return True
+            else:
+                if target == pattern:
+                    return True
+        return False
+
+    def _ip_matches(self, target: str) -> bool:
+        if target in self.ips:
+            return True
+        try:
+            addr = _ipaddress.ip_address(target)
+            return any(addr in net for net in self.cidrs)
+        except ValueError:
+            return False
+
+    def is_in_scope(self, target: str) -> bool:
+        if not self._loaded:
+            return True             # no scope file = open hunting (warn on first use)
+        target = target.strip()
+        return self._domain_matches(target) or self._ip_matches(target)
+
+    def check(self, target: str) -> bool:
+        """Return True if in scope; print warning and return False if not."""
+        if self.is_in_scope(target):
+            return True
+        warn(f"OUT OF SCOPE — skipping {target}")
+        return False
+
+    def filter_list(self, targets: List[str]) -> List[str]:
+        return [t for t in targets if self.is_in_scope(t)]
+
+    def summary(self) -> None:
+        title("Scope Summary")
+        if not self._loaded:
+            warn("No scope file loaded — all targets accepted")
+            return
+        for d in self.domains:
+            print(f"  {G}domain{RST}  {d}")
+        for ip in sorted(self.ips):
+            print(f"  {G}ip    {RST}  {ip}")
+        for cidr in self.cidrs:
+            print(f"  {G}cidr  {RST}  {cidr}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODULE: BUG BOUNTY — RECON
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Common paths probed during endpoint discovery
+_BB_PATHS = [
+    "/.git/config", "/.env", "/.env.backup", "/.env.local",
+    "/config.php", "/config.yml", "/config.yaml", "/config.json",
+    "/wp-config.php", "/web.config", "/app.config",
+    "/backup.zip", "/backup.tar.gz", "/db.sql", "/dump.sql",
+    "/robots.txt", "/sitemap.xml", "/.well-known/security.txt",
+    "/api/", "/api/v1/", "/api/v2/", "/graphql", "/swagger.json",
+    "/openapi.json", "/v1/api-docs", "/.DS_Store",
+    "/server-status", "/server-info", "/_profiler/",
+    "/actuator", "/actuator/health", "/actuator/env",
+    "/admin", "/admin/", "/administrator/", "/phpmyadmin/",
+    "/console", "/debug", "/__debug__/", "/trace",
+]
+
+# Header → technology mapping
+_TECH_HEADERS: Dict[str, str] = {
+    "x-powered-by":        "server",
+    "server":              "server",
+    "x-aspnet-version":    "ASP.NET",
+    "x-aspnetmvc-version": "ASP.NET MVC",
+    "x-drupal-cache":      "Drupal",
+    "x-joomla-page":       "Joomla",
+    "x-wp-total":          "WordPress",
+    "x-generator":         "cms",
+    "via":                 "proxy",
+    "x-varnish":           "Varnish",
+    "x-cache":             "cache",
+    "cf-ray":              "Cloudflare",
+    "x-amz-cf-id":         "AWS CloudFront",
+    "x-amz-request-id":    "AWS",
+    "x-azure-ref":         "Azure",
+}
+
+_BODY_PATTERNS: Dict[str, str] = {
+    r'wp-content':                          "WordPress",
+    r'Joomla! - Open Source Content Management': "Joomla",
+    r'<meta name="generator" content="([^"]+)"': "generator",
+    r'laravel_session':                     "Laravel",
+    r'csrfmiddlewaretoken':                 "Django",
+    r'__rails_session':                     "Rails",
+    r'react-app':                           "React",
+    r'ng-version=':                         "Angular",
+    r'data-reactroot':                      "React",
+    r'__nuxt':                              "Nuxt.js",
+    r'__next':                              "Next.js",
+}
+
+
+class BugBountyRecon:
+    """Phase 1 recon for bug bounty targets.
+
+    Methods:
+      enum_subdomains(domain)  → List[str]  (scope-filtered)
+      probe_endpoints(base_url) → List[Dict] (exposed paths)
+      fingerprint_tech(url)    → Dict       (detected technologies)
+      run_all(domain)          → summary dict
+    """
+
+    def __init__(self, scope: Optional[ScopeValidator] = None, rate: float = 0.5):
+        self.scope = scope or ScopeValidator()
+        self.rate  = rate   # seconds between HTTP requests
+
+    # ── subdomain enumeration ──────────────────────────────────────────────────
+
+    def _crtsh(self, domain: str) -> List[str]:
+        """Pull subdomains from certificate transparency logs (crt.sh)."""
+        try:
+            import urllib.request, urllib.error
+            url = f"https://crt.sh/?q=%.{domain}&output=json"
+            req = urllib.request.Request(url, headers={"User-Agent": "BugBountyRecon/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            subs = set()
+            for entry in data:
+                for name in entry.get("name_value", "").splitlines():
+                    name = name.strip().lstrip("*.")
+                    if name.endswith(f".{domain}") or name == domain:
+                        subs.add(name.lower())
+            return sorted(subs)
+        except Exception as exc:
+            warn(f"crt.sh lookup failed: {exc}")
+            return []
+
+    def _subfinder(self, domain: str) -> List[str]:
+        """Run subfinder if available."""
+        if not tool_exists("subfinder"):
+            return []
+        step("Running subfinder …")
+        out = run_s(["subfinder", "-d", domain, "-silent"], timeout=120)
+        return [l.strip() for l in out.splitlines() if l.strip()]
+
+    def _amass(self, domain: str) -> List[str]:
+        """Run amass passive enum if available."""
+        if not tool_exists("amass"):
+            return []
+        step("Running amass (passive) …")
+        out = run_s(["amass", "enum", "-passive", "-d", domain], timeout=180)
+        return [l.strip() for l in out.splitlines() if l.strip()]
+
+    def enum_subdomains(self, domain: str) -> List[str]:
+        """Enumerate subdomains via crt.sh + optional subfinder/amass."""
+        title(f"Subdomain Enumeration — {domain}")
+        out_dir = ensure_dir("bb_recon")
+
+        found: set = set()
+        step("Querying crt.sh certificate transparency …")
+        found.update(self._crtsh(domain))
+        found.update(self._subfinder(domain))
+        found.update(self._amass(domain))
+
+        subs = self.scope.filter_list(sorted(found))
+        info(f"Found {len(found)} subdomains, {len(subs)} in scope")
+
+        out_file = out_dir / "subdomains.txt"
+        out_file.write_text("\n".join(subs) + "\n")
+        success(f"Subdomains saved → {out_file}")
+
+        for s in subs:
+            print(f"  {G}+{RST} {s}")
+        return subs
+
+    # ── endpoint probing ───────────────────────────────────────────────────────
+
+    def _http_get(self, url: str) -> Optional[Tuple[int, Dict, str]]:
+        """Return (status, headers, body[:2048]) or None on error."""
+        try:
+            import urllib.request, urllib.error
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; BugBountyRecon/1.0)",
+                    "Accept": "text/html,application/json,*/*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status  = resp.status
+                headers = dict(resp.headers)
+                body    = resp.read(2048).decode("utf-8", errors="replace")
+                return status, headers, body
+        except Exception:
+            return None
+
+    def probe_endpoints(self, base_url: str) -> List[Dict]:
+        """Probe common sensitive paths; return list of hits."""
+        title(f"Endpoint Probe — {base_url}")
+        out_dir = ensure_dir("bb_recon")
+        base_url = base_url.rstrip("/")
+        hits: List[Dict] = []
+
+        for path in _BB_PATHS:
+            url = base_url + path
+            time.sleep(self.rate)
+            result = self._http_get(url)
+            if result is None:
+                continue
+            status, headers, body = result
+            if status in (200, 206):
+                severity = "High" if any(k in path for k in [".env", ".git", ".sql", "config"]) else "Medium"
+                hit = {"url": url, "status": status, "path": path, "severity": severity,
+                       "content_type": headers.get("Content-Type", ""), "snippet": body[:200]}
+                hits.append(hit)
+                c = R if severity == "High" else Y
+                print(f"  {c}[{status}]{RST} {path}")
+            elif status in (301, 302, 307, 308):
+                loc = headers.get("Location", "")
+                debug(f"  [{status}] {path} → {loc}")
+
+        out_file = out_dir / "endpoints.json"
+        out_file.write_text(json.dumps(hits, indent=2))
+        info(f"{len(hits)} exposed endpoints → {out_file}")
+        return hits
+
+    # ── technology fingerprinting ──────────────────────────────────────────────
+
+    def fingerprint_tech(self, url: str) -> Dict[str, List[str]]:
+        """Identify web technologies from HTTP headers and response body."""
+        title(f"Tech Fingerprint — {url}")
+        out_dir = ensure_dir("bb_recon")
+        tech: Dict[str, List[str]] = {}
+
+        result = self._http_get(url)
+        if result is None:
+            warn("Cannot reach target")
+            return tech
+
+        status, headers, body = result
+
+        # ── header signals ───────────────────────────────────────────────────
+        for hdr, label in _TECH_HEADERS.items():
+            val = headers.get(hdr) or headers.get(hdr.title())
+            if val:
+                key = label if label not in ("server", "cms", "proxy", "cache") else label
+                tech.setdefault(key, []).append(val)
+
+        # ── body patterns ────────────────────────────────────────────────────
+        for pattern, label in _BODY_PATTERNS.items():
+            m = re.search(pattern, body, re.IGNORECASE)
+            if m:
+                detected = m.group(1) if m.lastindex else label
+                tech.setdefault("cms/framework", []).append(detected)
+
+        # ── cookie fingerprints ──────────────────────────────────────────────
+        set_cookie = headers.get("Set-Cookie", "")
+        cookie_sigs = {
+            "PHPSESSID": "PHP", "JSESSIONID": "Java/Servlet",
+            "ASP.NET_SessionId": "ASP.NET", "laravel_session": "Laravel",
+            "ci_session": "CodeIgniter", "CFID": "ColdFusion",
+        }
+        for cookie_name, fw in cookie_sigs.items():
+            if cookie_name.lower() in set_cookie.lower():
+                tech.setdefault("server-side", []).append(fw)
+
+        # ── security headers audit ────────────────────────────────────────────
+        missing_sec = []
+        for h in ["Strict-Transport-Security", "Content-Security-Policy",
+                  "X-Frame-Options", "X-Content-Type-Options",
+                  "Referrer-Policy", "Permissions-Policy"]:
+            if not (headers.get(h) or headers.get(h.lower())):
+                missing_sec.append(h)
+        if missing_sec:
+            tech["missing_security_headers"] = missing_sec
+
+        for category, values in tech.items():
+            unique = list(dict.fromkeys(values))
+            tech[category] = unique
+            c = Y if category == "missing_security_headers" else G
+            print(f"  {c}{category}{RST}: {', '.join(unique)}")
+
+        out_file = out_dir / "tech_fingerprint.json"
+        out_file.write_text(json.dumps({"url": url, "status": status, "tech": tech}, indent=2))
+        success(f"Tech fingerprint → {out_file}")
+        return tech
+
+    # ── orchestrated run ───────────────────────────────────────────────────────
+
+    def run_all(self, domain: str, base_url: Optional[str] = None) -> Dict:
+        """Run full Phase 1: subdomains → endpoint probe → fingerprint."""
+        if not self.scope.check(domain):
+            return {}
+
+        results: Dict = {"domain": domain, "subdomains": [], "endpoints": [], "tech": {}}
+
+        results["subdomains"] = self.enum_subdomains(domain)
+
+        url = base_url or f"https://{domain}"
+        results["endpoints"] = self.probe_endpoints(url)
+        results["tech"]      = self.fingerprint_tech(url)
+
+        out_dir = ensure_dir("bb_recon")
+        summary_file = out_dir / "phase1_summary.json"
+        summary_file.write_text(json.dumps(results, indent=2, default=str))
+        title("Phase 1 Complete")
+        info(f"Subdomains : {len(results['subdomains'])}")
+        info(f"Endpoints  : {len(results['endpoints'])} exposed")
+        info(f"Tech       : {len(results['tech'])} categories")
+        success(f"Summary    → {summary_file}")
+        return results
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # REMEDIATION DATABASE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2610,6 +2992,18 @@ Examples:
     # Recommendation 3: dry-run
     p.add_argument("--dry-run",       action="store_true",
                    help="Print commands without executing them")
+    # ── Bug Bounty Phase 1 ────────────────────────────────────────────────────
+    bb = p.add_argument_group("Bug Bounty Recon (Phase 1)")
+    bb.add_argument("--bb-recon",     action="store_true",
+                    help="Run Phase 1 bug-bounty recon: subdomains, endpoints, tech fingerprint")
+    bb.add_argument("--bb-scope",     metavar="FILE",
+                    help="Scope file (JSON or plain text) — required for --bb-recon")
+    bb.add_argument("--bb-domain",    metavar="DOMAIN",
+                    help="Root domain for subdomain enumeration (overrides -d)")
+    bb.add_argument("--bb-url",       metavar="URL",
+                    help="Base URL for endpoint probing (default: https://<domain>)")
+    bb.add_argument("--bb-rate",      type=float, default=0.5, metavar="SECS",
+                    help="Delay between HTTP requests during recon (default: 0.5)")
     return p.parse_args()
 
 
@@ -2700,6 +3094,24 @@ def main():
         [k for k, v in vars(args).items() if v is True or (v and k not in
          ("target","domain","username","password","hash","output","interface"))]
     )
+
+    # ── Bug Bounty Phase 1 ────────────────────────────────────────────────────
+    if args.bb_recon:
+        scope_file = Path(args.bb_scope) if args.bb_scope else None
+        if scope_file and not scope_file.exists():
+            err(f"Scope file not found: {scope_file}")
+            sys.exit(ExitCode.CONFIG_ERROR)
+        scope = ScopeValidator(scope_file)
+        bb_domain = args.bb_domain or config.domain or config.ip
+        if not bb_domain:
+            err("--bb-recon requires --bb-domain or -d <domain>")
+            sys.exit(ExitCode.CONFIG_ERROR)
+        scope.add_target(bb_domain)
+        recon = BugBountyRecon(scope=scope, rate=args.bb_rate)
+        recon.run_all(bb_domain, base_url=args.bb_url)
+        generate_report()
+        success(f"Done — results in {OUTPUT_DIR}")
+        sys.exit(ExitCode.SUCCESS)
 
     if args.scan_cves:
         _phase("cves", CVEScanner.scan, ckpt, force)
