@@ -37,6 +37,27 @@ Aggressive scan:
 python BugHunterPro.py --target example.com --mode aggressive
 ```
 
+## HackerOne Scoped Scanner (`h1_recon_scanner.py`)
+
+Requires a scope file (one domain per line; `#` comments and `*.example.com` allowed).
+The scan refuses to run without one, and refuses a root domain the scope does not cover.
+
+```bash
+python h1_recon_scanner.py -d target-program.com -s scope.txt
+python h1_recon_scanner.py -d target-program.com -s scope.txt -t 3 --delay 1.0 --no-subdomains
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-s/--scope` | required | Scope file |
+| `-t/--threads` | 5 | Concurrent probe threads |
+| `--delay` | 0.2 | Minimum seconds between requests, shared across threads |
+| `--no-subdomains` | off | Scan only the root domain |
+| `--skip-sensitive` | off | Skip sensitive file probes |
+| `-o/--output` | `h1_bug_report.json` | JSON report path |
+
+Run the tests with `python3 -m unittest tests.test_h1_recon_scanner -v`.
+
 ## Reports
 
 Generates automatic reports in JSON and Markdown format with:
