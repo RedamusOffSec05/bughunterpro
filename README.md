@@ -39,24 +39,50 @@ python BugHunterPro.py --target example.com --mode aggressive
 
 ## HackerOne Scoped Scanner (`h1_recon_scanner.py`)
 
-Requires a scope file (one domain per line; `#` comments and `*.example.com` allowed).
-The scan refuses to run without one, and refuses a root domain the scope does not cover.
+Scope comes from HackerOne's Hacker API (`--program`) or a local file (`--scope`).
+Exactly one is required. The scan refuses to run with no usable scope, and refuses a
+root domain (`-d`) that the scope does not cover.
+
+**Scope semantics** (matching HackerOne):
+- `*.example.com` covers subdomains only, not `example.com` itself
+- `example.com` covers that exact host only
+
+### Against a HackerOne program
+
+Create an API token under your HackerOne API settings, then:
 
 ```bash
-python h1_recon_scanner.py -d target-program.com -s scope.txt
-python h1_recon_scanner.py -d target-program.com -s scope.txt -t 3 --delay 1.0 --no-subdomains
+export H1_API_USERNAME="your-api-token-identifier"
+export H1_API_TOKEN="your-api-token"
+python h1_recon_scanner.py -p program-handle
+```
+
+Credentials are read only from the environment, so they stay out of shell history
+and process listings. Eligible URL, WILDCARD and DOMAIN assets are scanned. Ineligible
+assets and other types (CIDR, API, Android, ...) are listed as skipped in the report.
+
+### Against a local scope file
+
+```bash
+python h1_recon_scanner.py -s scope.txt
+python h1_recon_scanner.py -s scope.txt -d api.target-program.com -t 3 --delay 1.0 --no-subdomains
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-s/--scope` | required | Scope file |
+| `-p/--program` | | HackerOne program handle (needs `H1_API_USERNAME` / `H1_API_TOKEN`) |
+| `-s/--scope` | | Local scope file, one hostname per line |
+| `-d/--domain` | | Root domain to scan; must be in scope |
 | `-t/--threads` | 5 | Concurrent probe threads |
 | `--delay` | 0.2 | Minimum seconds between requests, shared across threads |
-| `--no-subdomains` | off | Scan only the root domain |
+| `--no-subdomains` | off | Scan only the scope's explicit hosts |
 | `--skip-sensitive` | off | Skip sensitive file probes |
-| `-o/--output` | `h1_bug_report.json` | JSON report path |
+| `-o/--output` | `h1_bug_report.json` | JSON report; a Markdown summary is written beside it |
 
-Run the tests with `python3 -m unittest tests.test_h1_recon_scanner -v`.
+Nothing is submitted to HackerOne automatically. Verify every finding manually, then
+write the report yourself.
+
+Run the tests with `python3 -m unittest tests.test_h1_api tests.test_h1_recon_scanner -v`.
 
 ## Reports
 
