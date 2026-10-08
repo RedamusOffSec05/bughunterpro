@@ -192,5 +192,85 @@ class TestConfigFile(unittest.TestCase):
         self.assertEqual(target.domain, "original.local")
 
 
+def _encrypt_gpp_cpassword(plaintext: str) -> str:
+    """Test-only helper: encode `plaintext` the same way GPP does, so we can
+    round-trip through rot05.decrypt_gpp_cpassword without needing a
+    hand-copied real-world ciphertext."""
+    import base64
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    data = plaintext.encode("utf-16-le")
+    pad_len = 16 - (len(data) % 16)
+    data += bytes([pad_len]) * pad_len
+    encryptor = Cipher(algorithms.AES(rot05.GPP_AES_KEY), modes.CBC(b"\x00" * 16)).encryptor()
+    encrypted = encryptor.update(data) + encryptor.finalize()
+    return base64.b64encode(encrypted).decode().rstrip("=").replace("+", "-").replace("/", "_")
+
+
+class TestDecryptGppCpassword(unittest.TestCase):
+    def test_key_is_32_bytes_for_aes_256(self):
+        self.assertEqual(len(rot05.GPP_AES_KEY), 32)
+
+    def test_round_trip_recovers_plaintext(self):
+        cpassword = _encrypt_gpp_cpassword("P@ssw0rd123!")
+        self.assertEqual(rot05.decrypt_gpp_cpassword(cpassword), "P@ssw0rd123!")
+
+    def test_known_real_world_vector(self):
+        # Sample ciphertext taken verbatim from the `encrypted_data` literal in
+        # BustedSec/gpp-decrypt's gpp-decrypt.rb (github.com/BustedSec/gpp-decrypt).
+        # Confirms the key against an independent, real tool's test fixture,
+        # not just a round-trip through our own encode/decode.
+        cpassword = "j1Uyj3Vx8TY9LtLZil2uAuZkFQA/4latT76ZwgdHdhw"
+        self.assertEqual(rot05.decrypt_gpp_cpassword(cpassword), "Local*P4ssword!")
+
+    def test_round_trip_with_url_safe_characters(self):
+        # Pick a plaintext whose encrypted form is likely to need '-'/'_' swapped back.
+        for candidate in ("abc", "a longer password with spaces", "unicode-é-ü"):
+            cpassword = _encrypt_gpp_cpassword(candidate)
+            self.assertEqual(rot05.decrypt_gpp_cpassword(cpassword), candidate)
+
+    def test_empty_input_returns_empty_string(self):
+        self.assertEqual(rot05.decrypt_gpp_cpassword(""), "")
+
+    def test_garbage_input_does_not_raise(self):
+        self.assertEqual(rot05.decrypt_gpp_cpassword("not-valid-base64!!"), "")
+
+    def test_wrong_block_size_does_not_raise(self):
+        # Valid base64, but not a multiple of the AES block size once decoded.
+        self.assertEqual(rot05.decrypt_gpp_cpassword("YQ"), "")
+
+
+class TestExtractGppCredentials(unittest.TestCase):
+    def test_extracts_username_and_decrypted_password(self):
+        cpassword = _encrypt_gpp_cpassword("hunter2")
+        xml = (
+            f'<Properties action="U" userName="localadmin" cpassword="{cpassword}" '
+            f'newName="" fullName="" description="" />'
+        )
+        creds = rot05.extract_gpp_credentials(xml)
+        self.assertEqual(len(creds), 1)
+        self.assertEqual(creds[0]["username"], "localadmin")
+        self.assertEqual(creds[0]["password"], "hunter2")
+
+    def test_multiple_entries_in_one_document(self):
+        cpw1 = _encrypt_gpp_cpassword("first")
+        cpw2 = _encrypt_gpp_cpassword("second")
+        xml = (
+            f'<Properties userName="svc1" cpassword="{cpw1}" />'
+            f'<Properties runAs="svc2" cpassword="{cpw2}" />'
+        )
+        creds = rot05.extract_gpp_credentials(xml)
+        self.assertEqual([c["password"] for c in creds], ["first", "second"])
+        self.assertEqual([c["username"] for c in creds], ["svc1", "svc2"])
+
+    def test_no_cpassword_attribute_yields_no_credentials(self):
+        xml = '<Properties action="U" userName="localadmin" newName="" />'
+        self.assertEqual(rot05.extract_gpp_credentials(xml), [])
+
+    def test_empty_cpassword_attribute_is_skipped(self):
+        xml = '<Properties userName="localadmin" cpassword="" />'
+        self.assertEqual(rot05.extract_gpp_credentials(xml), [])
+
+
 if __name__ == "__main__":
     unittest.main()
