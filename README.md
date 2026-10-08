@@ -19,23 +19,23 @@ Automated Bug Bounty Hunting Framework
 
 ## Installation
 
-\\\ash
+```bash
 git clone https://github.com/RedamusOffSec05/bughunterpro.git
 cd bughunterpro
 pip install -r requirements.txt
-\\\
+```
 
 ## Usage
 
 Basic scan:
-\\\ash
+```bash
 python BugHunterPro.py --target example.com
-\\\
+```
 
 Aggressive scan:
-\\\ash
+```bash
 python BugHunterPro.py --target example.com --mode aggressive
-\\\
+```
 
 ## Reports
 
