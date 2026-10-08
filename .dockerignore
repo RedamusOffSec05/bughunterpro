@@ -1,0 +1,36 @@
+# Version control
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime output (never bake pentest results into the image)
+rot05_output/
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Secrets (never accidentally baked in)
+.env
+*.key
+*.pem
+*.pfx

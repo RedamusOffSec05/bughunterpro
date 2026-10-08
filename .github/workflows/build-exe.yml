@@ -1,0 +1,89 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+      - "claude/**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:   # manual trigger from GitHub Actions tab
+
+jobs:
+  build-windows:
+    name: PyInstaller → rot05.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install colorama cryptography requests dnspython beautifulsoup4
+          pip install impacket
+          pip install certipy-ad
+        # weasyprint excluded — needs GTK which isn't on Windows runners
+
+      - name: Build exe
+        run: pyinstaller rot05.spec --noconfirm
+
+      - name: Verify build
+        run: |
+          if (Test-Path "dist\rot05.exe") {
+            $size = [Math]::Round((Get-Item "dist\rot05.exe").Length / 1MB, 1)
+            Write-Host "rot05.exe built successfully — $size MB"
+          } else {
+            Write-Error "rot05.exe not found after build"
+            exit 1
+          }
+        shell: pwsh
+
+      # ── Upload exe as workflow artifact (available for 30 days) ──────────
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rot05-windows-x64
+          path: dist/rot05.exe
+          retention-days: 30
+
+      # ── Create GitHub Release when a tag is pushed (v1.0, v2.0, etc.) ───
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/rot05.exe
+          generate_release_notes: true
+          body: |
+            ## rot05.exe — Windows 11 / 10 x64
+
+            Single-file executable. No Python installation required.
+
+            ### Requirements on target machine
+            - [Nmap for Windows](https://nmap.org/download.html) — for port scanning (`--enum`, `--scan-cves`)
+            - [impacket scripts](https://github.com/fortra/impacket) are bundled — no separate install needed
+
+            ### Linux-only tools (gracefully skipped on Windows)
+            `smbclient`, `ldapsearch`, `rpcclient`, `enum4linux`, `Responder`
+
+            ### Usage
+            ```
+            rot05.exe                                        # interactive shell
+            rot05.exe -t 10.10.10.10 --enum
+            rot05.exe -t 10.10.10.10 -d lab.local -u admin -P --full
+            rot05.exe -t 10.10.10.10 --kerberoast
+            rot05.exe -t 10.10.10.10 --scan-cves
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
