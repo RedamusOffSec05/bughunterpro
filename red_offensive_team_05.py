@@ -1496,6 +1496,1072 @@ class BugBountyRecon:
         return results
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODULE: BUG BOUNTY — WEB VULNERABILITY SCANNERS  (Phase 2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── shared HTTP helper (scope-aware, rate-limited) ────────────────────────────
+
+def _bb_get(url: str, headers: Optional[Dict] = None,
+            timeout: int = 10, allow_redirects: bool = False
+            ) -> Optional[Tuple[int, Dict, str]]:
+    """GET request for bug-bounty scanners.
+
+    Returns (status, headers_dict, body_str) or None on network error.
+    Does NOT follow redirects by default so open-redirect tests see Location.
+    """
+    import urllib.request, urllib.error
+    h = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.9",
+    }
+    if headers:
+        h.update(headers)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect) if not allow_redirects \
+             else urllib.request.build_opener()
+    try:
+        req = urllib.request.Request(url, headers=h)
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, dict(resp.headers), \
+                   resp.read(4096).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), \
+               e.read(512).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _bb_save(subdir: str, filename: str, data) -> Path:
+    out = ensure_dir(subdir)
+    p = out / filename
+    p.write_text(json.dumps(data, indent=2, default=str))
+    return p
+
+
+# ── SSRF Scanner ──────────────────────────────────────────────────────────────
+
+_SSRF_PARAMS = [
+    "url", "uri", "redirect", "redirectUri", "redirect_uri",
+    "fetch", "src", "href", "path", "dest", "destination",
+    "host", "site", "html", "page", "data", "ref", "return",
+    "returnUrl", "return_url", "load", "open", "feed", "endpoint",
+    "target", "source", "image", "img", "file", "proxy",
+]
+
+_SSRF_PAYLOADS = [
+    ("localhost",      "http://localhost/"),
+    ("127.0.0.1",     "http://127.0.0.1/"),
+    ("0.0.0.0",       "http://0.0.0.0/"),
+    ("ipv6_local",    "http://[::1]/"),
+    ("decimal_127",   "http://2130706433/"),
+    ("hex_127",       "http://0x7f000001/"),
+    ("aws_metadata",  "http://169.254.169.254/latest/meta-data/"),
+    ("aws_userdata",  "http://169.254.169.254/latest/user-data/"),
+    ("gcp_metadata",  "http://metadata.google.internal/computeMetadata/v1/"),
+    ("azure_metadata","http://169.254.169.254/metadata/instance?api-version=2021-02-01"),
+    ("internal_dns",  "http://internal/"),
+    ("burp_collab",   "http://ssrf-probe.burpcollaborator.net/"),
+]
+
+_SSRF_SIGNATURES = [
+    "ami-id", "instance-id", "meta-data", "iam/security-credentials",
+    "computeMetadata", "instance/service-accounts",
+    "compute/v1/projects", "169.254.169.254",
+    "root:", "daemon:", "/etc/passwd", "localhost", "127.0.0.1",
+]
+
+
+class SSRFScanner:
+    """Detect Server-Side Request Forgery via parameter injection."""
+
+    def __init__(self, scope: Optional['ScopeValidator'] = None, rate: float = 0.3):
+        self.scope = scope
+        self.rate  = rate
+
+    def _extract_params(self, url: str) -> List[str]:
+        from urllib.parse import urlparse, parse_qs
+        try:
+            qs = urlparse(url).query
+            return list(parse_qs(qs).keys()) if qs else []
+        except Exception:
+            return []
+
+    def _build_url(self, base: str, param: str, value: str) -> str:
+        from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
+        p = urlparse(base)
+        params = dict(parse_qsl(p.query))
+        params[param] = value
+        return urlunparse(p._replace(query=urlencode(params)))
+
+    def _is_ssrf(self, body: str) -> bool:
+        body_l = body.lower()
+        return any(sig.lower() in body_l for sig in _SSRF_SIGNATURES)
+
+    def scan_url(self, url: str) -> List[Dict]:
+        hits: List[Dict] = []
+        existing_params = self._extract_params(url)
+
+        for param in (_SSRF_PARAMS if not existing_params else existing_params):
+            for label, payload in _SSRF_PAYLOADS:
+                test_url = self._build_url(url, param, payload)
+                time.sleep(self.rate)
+                r = _bb_get(test_url, timeout=8)
+                if r is None:
+                    continue
+                status, hdrs, body = r
+                if self._is_ssrf(body):
+                    hit = {
+                        "type":    "ssrf",
+                        "url":     test_url,
+                        "param":   param,
+                        "payload": payload,
+                        "label":   label,
+                        "status":  status,
+                        "snippet": body[:300],
+                    }
+                    hits.append(hit)
+                    print(f"  {R}[SSRF]{RST} {param}={label} → {status} — {body[:80]}")
+                    break  # one confirmed payload per param is enough
+        return hits
+
+    def scan(self, urls: List[str]) -> List[Dict]:
+        title("SSRF Scanner")
+        all_hits: List[Dict] = []
+        for url in urls:
+            if self.scope and not self.scope.check(url):
+                continue
+            step(f"Testing SSRF: {url}")
+            all_hits.extend(self.scan_url(url))
+
+        out = _bb_save("bb_vulns", "ssrf.json", all_hits)
+        if all_hits:
+            warn(f"{len(all_hits)} SSRF candidates → {out}")
+        else:
+            success("No SSRF detected")
+        return all_hits
+
+
+# ── IDOR Scanner ──────────────────────────────────────────────────────────────
+
+_IDOR_PATTERNS = [
+    r'/api/v\d*/(?:user|account|profile|order|invoice|file|document|record|item|resource)/(\d+)',
+    r'/(?:user|account|profile|order|invoice|file|document|record)/(\d+)',
+    r'[?&](?:id|user_id|account_id|order_id|doc_id|file_id|record_id)=(\d+)',
+    r'/(\d{4,})(?:/|$|\?)',
+]
+
+_IDOR_API_PREFIXES = [
+    "/api/v1/user/{id}", "/api/v2/user/{id}", "/api/user/{id}",
+    "/api/v1/account/{id}", "/api/v1/order/{id}", "/api/v1/invoice/{id}",
+    "/api/v1/profile/{id}", "/api/v1/document/{id}", "/api/v1/file/{id}",
+    "/user/{id}", "/account/{id}", "/profile/{id}",
+]
+
+
+class IDORScanner:
+    """Detect Insecure Direct Object Reference via sequential ID enumeration."""
+
+    def __init__(self, scope: Optional['ScopeValidator'] = None, rate: float = 0.4,
+                 probe_count: int = 5):
+        self.scope       = scope
+        self.rate        = rate
+        self.probe_count = probe_count
+
+    def _find_ids(self, url: str) -> List[Tuple[str, int]]:
+        """Return list of (url_with_placeholder, found_id) pairs."""
+        found = []
+        for pattern in _IDOR_PATTERNS:
+            m = re.search(pattern, url)
+            if m:
+                try:
+                    obj_id = int(m.group(1))
+                    template = url[:m.start(1)] + "{id}" + url[m.end(1):]
+                    found.append((template, obj_id))
+                except (ValueError, IndexError):
+                    pass
+        return found
+
+    def _significant_diff(self, body1: str, body2: str) -> bool:
+        if len(body1) < 50 or len(body2) < 50:
+            return False
+        if abs(len(body1) - len(body2)) > 100:
+            return True
+        common = set(body1.split()) & set(body2.split())
+        total  = len(set(body1.split()) | set(body2.split()))
+        if total == 0:
+            return False
+        similarity = len(common) / total
+        return similarity < 0.6
+
+    def scan_url(self, url: str) -> List[Dict]:
+        hits: List[Dict] = []
+        id_specs = self._find_ids(url)
+
+        for template, base_id in id_specs:
+            time.sleep(self.rate)
+            r_base = _bb_get(url, allow_redirects=True)
+            if r_base is None:
+                continue
+            status_base, _, body_base = r_base
+
+            for delta in range(1, self.probe_count + 1):
+                for candidate_id in [base_id + delta, max(1, base_id - delta)]:
+                    test_url = template.replace("{id}", str(candidate_id))
+                    time.sleep(self.rate)
+                    r = _bb_get(test_url, allow_redirects=True)
+                    if r is None or r[0] in (403, 401, 404):
+                        continue
+                    status, _, body = r
+                    if status == 200 and self._significant_diff(body_base, body):
+                        hit = {
+                            "type":        "idor",
+                            "original_url": url,
+                            "test_url":     test_url,
+                            "original_id":  base_id,
+                            "tested_id":    candidate_id,
+                            "status":       status,
+                            "length_diff":  abs(len(body) - len(body_base)),
+                            "snippet":      body[:300],
+                        }
+                        hits.append(hit)
+                        print(f"  {R}[IDOR]{RST} id {base_id}→{candidate_id} response differs ({hit['length_diff']} bytes)")
+                        break
+        return hits
+
+    def scan_common(self, base_url: str) -> List[Dict]:
+        """Probe common API IDOR endpoints on base_url."""
+        hits: List[Dict] = []
+        base_url = base_url.rstrip("/")
+        for tpl in _IDOR_API_PREFIXES:
+            for oid in [1, 2, 3]:
+                url = base_url + tpl.replace("{id}", str(oid))
+                time.sleep(self.rate)
+                r = _bb_get(url, allow_redirects=True)
+                if r is None:
+                    continue
+                status, _, body = r
+                if status == 200 and len(body) > 100:
+                    for oid2 in [oid + 1, oid + 2]:
+                        url2 = base_url + tpl.replace("{id}", str(oid2))
+                        time.sleep(self.rate)
+                        r2 = _bb_get(url2, allow_redirects=True)
+                        if r2 and r2[0] == 200 and self._significant_diff(body, r2[2]):
+                            hit = {
+                                "type":      "idor",
+                                "endpoint":  tpl,
+                                "test_url":  url2,
+                                "base_id":   oid,
+                                "test_id":   oid2,
+                                "status":    200,
+                                "snippet":   r2[2][:300],
+                            }
+                            hits.append(hit)
+                            print(f"  {R}[IDOR]{RST} {tpl} id {oid}→{oid2} accessible")
+                            break
+        return hits
+
+    def scan(self, base_url: str, urls: Optional[List[str]] = None) -> List[Dict]:
+        title("IDOR Scanner")
+        all_hits: List[Dict] = []
+        if self.scope and not self.scope.check(base_url):
+            return all_hits
+
+        all_hits.extend(self.scan_common(base_url))
+        for url in (urls or []):
+            if self.scope and not self.scope.check(url):
+                continue
+            all_hits.extend(self.scan_url(url))
+
+        out = _bb_save("bb_vulns", "idor.json", all_hits)
+        if all_hits:
+            warn(f"{len(all_hits)} IDOR candidates → {out}")
+        else:
+            success("No IDOR detected")
+        return all_hits
+
+
+# ── Open Redirect Scanner ─────────────────────────────────────────────────────
+
+_REDIR_PARAMS = [
+    "next", "return", "returnUrl", "return_url", "redirect",
+    "redirect_uri", "redirectUri", "goto", "url", "target",
+    "redir", "destination", "dest", "continue", "forward",
+    "back", "ref", "callback", "callbackUrl", "from",
+    "returnTo", "r", "u",
+]
+
+_REDIR_PAYLOADS = [
+    "https://evil.example.com/",
+    "//evil.example.com/",
+    "\\/\\/evil.example.com/",
+    "/\\evil.example.com/",
+    "https:evil.example.com",
+    "///evil.example.com",
+    "https://evil.example.com%2F@legit.example.com/",
+    "//%09evil.example.com/",
+]
+
+
+class OpenRedirectScanner:
+    """Detect open redirect vulnerabilities via parameter injection."""
+
+    EVIL_DOMAIN = "evil.example.com"
+
+    def __init__(self, scope: Optional['ScopeValidator'] = None, rate: float = 0.3):
+        self.scope = scope
+        self.rate  = rate
+
+    def _build_url(self, base: str, param: str, value: str) -> str:
+        from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
+        p = urlparse(base)
+        params = dict(parse_qsl(p.query))
+        params[param] = value
+        return urlunparse(p._replace(query=urlencode(params)))
+
+    def _is_redirect_to_evil(self, status: int, hdrs: Dict) -> bool:
+        if status not in (301, 302, 303, 307, 308):
+            return False
+        loc = hdrs.get("Location", "").lower()
+        return self.EVIL_DOMAIN in loc
+
+    def scan_url(self, url: str) -> List[Dict]:
+        hits: List[Dict] = []
+        existing = list(set(_REDIR_PARAMS))
+
+        for param in existing:
+            for payload in _REDIR_PAYLOADS:
+                test_url = self._build_url(url, param, payload)
+                time.sleep(self.rate)
+                r = _bb_get(test_url, allow_redirects=False)
+                if r is None:
+                    continue
+                status, hdrs, _ = r
+                if self._is_redirect_to_evil(status, hdrs):
+                    hit = {
+                        "type":     "open_redirect",
+                        "url":      test_url,
+                        "param":    param,
+                        "payload":  payload,
+                        "status":   status,
+                        "location": hdrs.get("Location", ""),
+                    }
+                    hits.append(hit)
+                    print(f"  {R}[REDIR]{RST} {param}={payload[:40]} → {status} {hdrs.get('Location','')}")
+                    break
+        return hits
+
+    def scan(self, urls: List[str]) -> List[Dict]:
+        title("Open Redirect Scanner")
+        all_hits: List[Dict] = []
+        for url in urls:
+            if self.scope and not self.scope.check(url):
+                continue
+            step(f"Testing redirects: {url}")
+            all_hits.extend(self.scan_url(url))
+
+        out = _bb_save("bb_vulns", "open_redirect.json", all_hits)
+        if all_hits:
+            warn(f"{len(all_hits)} open redirect candidates → {out}")
+        else:
+            success("No open redirects detected")
+        return all_hits
+
+
+# ── Subdomain Takeover Scanner ────────────────────────────────────────────────
+
+_TAKEOVER_FINGERPRINTS: Dict[str, Dict] = {
+    "github.io":              {"sig": ["There isn't a GitHub Pages site here",
+                                       "For root URLs (like http://example.com/) you must provide an index.html"],
+                               "service": "GitHub Pages"},
+    "herokuapps.com":         {"sig": ["No such app", "herokucdn.com/error-pages/no-such-app"],
+                               "service": "Heroku"},
+    "heroku.com":             {"sig": ["No such app"],
+                               "service": "Heroku"},
+    "s3.amazonaws.com":       {"sig": ["NoSuchBucket", "The specified bucket does not exist"],
+                               "service": "AWS S3"},
+    "s3-website":             {"sig": ["NoSuchBucket", "The specified bucket does not exist"],
+                               "service": "AWS S3"},
+    "cloudfront.net":         {"sig": ["Bad request", "ERROR: The request could not be satisfied"],
+                               "service": "AWS CloudFront"},
+    "fastly.net":             {"sig": ["Fastly error: unknown domain"],
+                               "service": "Fastly"},
+    "zendesk.com":            {"sig": ["Help Center Closed", "this help center no longer exists"],
+                               "service": "Zendesk"},
+    "helpjuice.com":          {"sig": ["We could not find what you're looking for"],
+                               "service": "HelpJuice"},
+    "helpscoutdocs.com":      {"sig": ["No settings were found for this company"],
+                               "service": "HelpScout"},
+    "shopify.com":            {"sig": ["Sorry, this shop is currently unavailable",
+                                       "Only one step away from your own online store"],
+                               "service": "Shopify"},
+    "tumblr.com":             {"sig": ["There's nothing here.", "Whatever you were looking for doesn't currently exist"],
+                               "service": "Tumblr"},
+    "wordpress.com":          {"sig": ["Do you want to register"],
+                               "service": "WordPress.com"},
+    "ghost.io":               {"sig": ["The thing you were looking for is no longer here"],
+                               "service": "Ghost"},
+    "surge.sh":               {"sig": ["project not found"],
+                               "service": "Surge.sh"},
+    "netlify.app":            {"sig": ["Not Found - Request ID"],
+                               "service": "Netlify"},
+    "readme.io":              {"sig": ["Project doesnt exist yet", "project not found"],
+                               "service": "Readme.io"},
+    "gitbook.io":             {"sig": ["If you need help"],
+                               "service": "GitBook"},
+    "freshdesk.com":          {"sig": ["There is no helpdesk here"],
+                               "service": "Freshdesk"},
+    "uservoice.com":          {"sig": ["This UserVoice subdomain is currently available"],
+                               "service": "UserVoice"},
+    "statuspage.io":          {"sig": ["You are being redirected", "page not found"],
+                               "service": "Statuspage"},
+    "teamwork.com":           {"sig": ["Oops - We didn't find your site"],
+                               "service": "Teamwork"},
+    "pingdom.com":            {"sig": ["Sorry, couldn't find the status page"],
+                               "service": "Pingdom"},
+    "bitbucket.io":           {"sig": ["Repository not found"],
+                               "service": "Bitbucket"},
+    "azurewebsites.net":      {"sig": ["Web App - Unavailable", "This web app is stopped"],
+                               "service": "Azure Web Apps"},
+    "cloudapp.net":           {"sig": ["404 Not Found"],
+                               "service": "Azure CloudApp"},
+    "trafficmanager.net":     {"sig": ["404 Not Found"],
+                               "service": "Azure Traffic Manager"},
+    "msedge.net":             {"sig": ["404 Not Found"],
+                               "service": "Azure"},
+}
+
+
+class SubdomainTakeoverScanner:
+    """Detect dangling CNAME records pointing to unclaimed cloud services."""
+
+    def __init__(self, scope: Optional['ScopeValidator'] = None, rate: float = 0.5):
+        self.scope = scope
+        self.rate  = rate
+
+    def _get_cname(self, subdomain: str) -> Optional[str]:
+        try:
+            import dns.resolver
+            answers = dns.resolver.resolve(subdomain, "CNAME")
+            for rdata in answers:
+                return str(rdata.target).rstrip(".").lower()
+        except Exception:
+            return None
+
+    def _check_body_for_takeover(self, body: str) -> Optional[Tuple[str, str]]:
+        for cname_part, info in _TAKEOVER_FINGERPRINTS.items():
+            for sig in info["sig"]:
+                if sig.lower() in body.lower():
+                    return cname_part, info["service"]
+        return None
+
+    def check_subdomain(self, subdomain: str) -> Optional[Dict]:
+        cname = self._get_cname(subdomain)
+        if not cname:
+            return None
+
+        # Check if CNAME target matches known services
+        matched_service = None
+        for cname_part, info in _TAKEOVER_FINGERPRINTS.items():
+            if cname_part in cname:
+                matched_service = info["service"]
+                break
+
+        if not matched_service:
+            return None
+
+        # Fetch the subdomain and look for takeover signatures
+        time.sleep(self.rate)
+        for scheme in ("https", "http"):
+            r = _bb_get(f"{scheme}://{subdomain}/", allow_redirects=True, timeout=8)
+            if r is None:
+                continue
+            status, _, body = r
+            match = self._check_body_for_takeover(body)
+            if match:
+                cname_match, service = match
+                hit = {
+                    "type":     "subdomain_takeover",
+                    "subdomain": subdomain,
+                    "cname":    cname,
+                    "service":  service,
+                    "status":   status,
+                    "snippet":  body[:300],
+                }
+                print(f"  {R}[TAKEOVER]{RST} {subdomain} → {cname} ({service}) — VULNERABLE")
+                return hit
+        return None
+
+    def scan(self, subdomains: List[str]) -> List[Dict]:
+        title("Subdomain Takeover Scanner")
+        hits: List[Dict] = []
+
+        for sub in subdomains:
+            if self.scope and not self.scope.check(sub):
+                continue
+            result = self.check_subdomain(sub)
+            if result:
+                hits.append(result)
+
+        out = _bb_save("bb_vulns", "takeover.json", hits)
+        if hits:
+            warn(f"{len(hits)} subdomain takeover candidates → {out}")
+        else:
+            success("No subdomain takeovers detected")
+        return hits
+
+
+# ── Exposed Secrets Scanner ───────────────────────────────────────────────────
+
+_SECRET_PATTERNS: Dict[str, str] = {
+    "AWS Access Key ID":    r'AKIA[0-9A-Z]{16}',
+    "AWS Secret Key":       r'(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+=]{40}',
+    "GitHub Token (PAT)":   r'ghp_[0-9A-Za-z]{36}',
+    "GitHub OAuth":         r'gho_[0-9A-Za-z]{36}',
+    "GitHub App Token":     r'(ghu|ghs)_[0-9A-Za-z]{36}',
+    "Slack Token":          r'xox[baprs]-[0-9A-Za-z-]{10,}',
+    "Google API Key":       r'AIza[0-9A-Za-z_-]{35}',
+    "Stripe Secret Key":    r'sk_live_[0-9A-Za-z]{24,}',
+    "Stripe Publishable":   r'pk_live_[0-9A-Za-z]{24,}',
+    "Twilio Account SID":   r'AC[a-z0-9]{32}',
+    "Twilio Auth Token":    r'SK[0-9a-fA-F]{32}',
+    "SendGrid API Key":     r'SG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}',
+    "Mailgun API Key":      r'key-[0-9a-zA-Z]{32}',
+    "Firebase Key":         r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}',
+    "Private Key Block":    r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
+    "JWT Token":            r'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}',
+    "Password in JS":       r'(?i)(?:password|passwd|pwd|secret|api_key|apikey)\s*[=:]\s*["\']([^"\']{6,})["\']',
+    "Bearer Token in code": r'(?i)Authorization["\']?\s*[=:]\s*["\']?Bearer\s+([A-Za-z0-9_.~+/-]+=*)',
+    "Database URL":         r'(?i)(?:postgres|mysql|mongodb|redis)://[^\s"\'<>]{10,}',
+    "Basic Auth URL":       r'https?://[A-Za-z0-9_-]+:[^@\s]{4,}@',
+    "Mailchimp API Key":    r'[0-9a-f]{32}-us[0-9]{1,2}',
+    "Heroku API Key":       r'(?i)heroku[_\-]?api[_\-]?key\s*[=:]\s*[0-9A-Fa-f-]{36}',
+    "NPM Token":            r'npm_[A-Za-z0-9]{36}',
+    "Discord Token":        r'[MN][A-Za-z0-9]{23}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}',
+}
+
+_SECRET_PATHS = [
+    "/static/main.js", "/static/app.js", "/static/bundle.js",
+    "/js/app.js", "/js/main.js", "/js/bundle.js", "/js/vendor.js",
+    "/assets/js/app.js", "/assets/app.js",
+    "/.env", "/.env.local", "/.env.production", "/.env.staging",
+    "/config.js", "/config.json", "/settings.js",
+    "/api/config", "/api/settings",
+    "/.git/config", "/.svn/entries",
+    "/debug/vars", "/debug/pprof/",
+    "/actuator/env", "/actuator/configprops",
+]
+
+
+class ExposedSecretsScanner:
+    """Find hardcoded credentials and API keys in public JS and config files."""
+
+    def __init__(self, scope: Optional['ScopeValidator'] = None, rate: float = 0.3):
+        self.scope = scope
+        self.rate  = rate
+
+    def _scan_content(self, content: str, source_url: str) -> List[Dict]:
+        findings = []
+        for label, pattern in _SECRET_PATTERNS.items():
+            for m in re.finditer(pattern, content, re.MULTILINE):
+                matched = m.group(0)
+                # Redact most of the value so it's not stored in plaintext
+                if len(matched) > 20:
+                    display = matched[:8] + "..." + matched[-4:]
+                else:
+                    display = matched[:6] + "***"
+                # Skip obvious false positives
+                if any(fp in matched.lower() for fp in ["example", "placeholder", "your_", "xxx", "test_", "dummy"]):
+                    continue
+                line_no = content[:m.start()].count("\n") + 1
+                findings.append({
+                    "type":    "exposed_secret",
+                    "secret_type": label,
+                    "source":  source_url,
+                    "line":    line_no,
+                    "match":   display,
+                    "context": content[max(0, m.start()-30):m.end()+30].strip(),
+                })
+                print(f"  {R}[SECRET]{RST} {label} in {source_url}:{line_no}")
+        return findings
+
+    def _find_js_links(self, base_url: str, body: str) -> List[str]:
+        urls = []
+        for m in re.finditer(r'src=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', body):
+            href = m.group(1)
+            if href.startswith("//"):
+                href = "https:" + href
+            elif not href.startswith("http"):
+                from urllib.parse import urljoin
+                href = urljoin(base_url, href)
+            urls.append(href)
+        return urls[:20]   # cap at 20 JS files
+
+    def scan(self, base_url: str) -> List[Dict]:
+        title("Exposed Secrets Scanner")
+        all_hits: List[Dict] = []
+        if self.scope and not self.scope.check(base_url):
+            return all_hits
+
+        # 1. Scan known sensitive paths
+        base = base_url.rstrip("/")
+        for path in _SECRET_PATHS:
+            time.sleep(self.rate)
+            r = _bb_get(base + path, allow_redirects=True)
+            if r is None:
+                continue
+            status, _, body = r
+            if status == 200 and len(body) > 10:
+                hits = self._scan_content(body, base + path)
+                all_hits.extend(hits)
+
+        # 2. Fetch main page and discover JS files
+        time.sleep(self.rate)
+        r = _bb_get(base_url, allow_redirects=True)
+        if r:
+            _, _, main_body = r
+            js_urls = self._find_js_links(base_url, main_body)
+            for js_url in js_urls:
+                if self.scope and not self.scope.check(js_url):
+                    continue
+                time.sleep(self.rate)
+                r2 = _bb_get(js_url, allow_redirects=True)
+                if r2 and r2[0] == 200:
+                    hits = self._scan_content(r2[2], js_url)
+                    all_hits.extend(hits)
+
+        out = _bb_save("bb_vulns", "secrets.json", all_hits)
+        if all_hits:
+            warn(f"{len(all_hits)} exposed secret candidates → {out}")
+        else:
+            success("No exposed secrets detected")
+        return all_hits
+
+
+# ── Nuclei Wrapper ────────────────────────────────────────────────────────────
+
+_NUCLEI_SEVERITY_MAP = {
+    "critical": "Critical",
+    "high":     "High",
+    "medium":   "Medium",
+    "low":      "Low",
+    "info":     "Info",
+    "unknown":  "Info",
+}
+
+_NUCLEI_TAGS = "cves,exposures,misconfigurations,vulnerabilities,default-logins,takeovers"
+
+
+class NucleiWrapper:
+    """Run Nuclei and ingest results into the findings pipeline."""
+
+    def __init__(self, scope: Optional['ScopeValidator'] = None):
+        self.scope = scope
+
+    def _available(self) -> bool:
+        return tool_exists("nuclei")
+
+    def _update_templates(self) -> None:
+        step("Updating Nuclei templates …")
+        run(["nuclei", "-update-templates"], timeout=60)
+
+    def scan(self, targets: List[str]) -> List[Dict]:
+        title("Nuclei Scanner")
+
+        if not self._available():
+            warn("nuclei not found — install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest")
+            return []
+
+        out_dir  = ensure_dir("bb_nuclei")
+        out_json = out_dir / "nuclei_results.jsonl"
+
+        scope_targets = [t for t in targets
+                         if (not self.scope) or self.scope.check(t)]
+        if not scope_targets:
+            warn("No in-scope targets for Nuclei")
+            return []
+
+        targets_file = out_dir / "targets.txt"
+        targets_file.write_text("\n".join(scope_targets))
+
+        self._update_templates()
+
+        step(f"Running Nuclei on {len(scope_targets)} target(s) …")
+        run([
+            "nuclei",
+            "-l",  str(targets_file),
+            "-tags", _NUCLEI_TAGS,
+            "-json-export", str(out_json),
+            "-silent",
+            "-rate-limit", "25",
+            "-bulk-size", "10",
+            "-concurrency", "5",
+        ], timeout=600)
+
+        findings: List[Dict] = []
+        if not out_json.exists():
+            warn("Nuclei produced no output")
+            return findings
+
+        for line in out_json.read_text().splitlines():
+            try:
+                r = json.loads(line)
+                info_block = r.get("info", {})
+                sev = _NUCLEI_SEVERITY_MAP.get(
+                    info_block.get("severity", "unknown").lower(), "Info")
+                hit = {
+                    "type":        "nuclei",
+                    "template_id": r.get("template-id", ""),
+                    "name":        info_block.get("name", r.get("template-id", "")),
+                    "severity":    sev,
+                    "url":         r.get("matched-at", ""),
+                    "description": info_block.get("description", ""),
+                    "reference":   info_block.get("reference", []),
+                    "tags":        info_block.get("tags", []),
+                    "snippet":     str(r.get("extracted-results", ""))[:300],
+                }
+                findings.append(hit)
+                c = R if sev == "Critical" else Y if sev == "High" else B
+                print(f"  {c}[{sev}]{RST} {hit['name']} — {hit['url']}")
+            except Exception:
+                continue
+
+        _bb_save("bb_nuclei", "nuclei_findings.json", findings)
+        info(f"{len(findings)} Nuclei findings")
+        return findings
+
+
+# ── Bug Bounty Findings Collector ─────────────────────────────────────────────
+
+def _collect_bb_findings() -> List[Dict]:
+    """Read Phase 2 scan outputs and return structured finding dicts."""
+    findings: List[Dict] = []
+    bb_dir = OUTPUT_DIR / "bb_vulns"
+    if not bb_dir.exists():
+        return findings
+
+    severity_map = {
+        "ssrf":             "Critical",
+        "idor":             "High",
+        "open_redirect":    "Medium",
+        "subdomain_takeover": "High",
+        "exposed_secret":   "Critical",
+        "nuclei":           None,   # uses its own severity
+    }
+
+    mitre_map = {
+        "ssrf":             "T1090",
+        "idor":             "T1530",
+        "open_redirect":    "T1598",
+        "subdomain_takeover": "T1584",
+        "exposed_secret":   "T1552",
+    }
+
+    for fname, finding_type in [
+        ("ssrf.json",         "ssrf"),
+        ("idor.json",         "idor"),
+        ("open_redirect.json","open_redirect"),
+        ("takeover.json",     "subdomain_takeover"),
+        ("secrets.json",      "exposed_secret"),
+    ]:
+        fp = bb_dir / fname
+        if not fp.exists():
+            continue
+        try:
+            items = json.loads(fp.read_text())
+        except Exception:
+            continue
+        for item in items:
+            rec = REMEDIATION_DB.get(finding_type, {})
+            sev = severity_map.get(finding_type, "Medium")
+            findings.append({
+                "key":         finding_type,
+                "title":       rec.get("title", item.get("name", finding_type)),
+                "severity":    sev,
+                "description": rec.get("description", ""),
+                "remediation": rec.get("remediation", []),
+                "mitre":       mitre_map.get(finding_type, ""),
+                "references":  rec.get("references", []),
+                "evidence":    json.dumps(item, default=str)[:400],
+            })
+
+    # Nuclei findings
+    nf = OUTPUT_DIR / "bb_nuclei" / "nuclei_findings.json"
+    if nf.exists():
+        try:
+            for item in json.loads(nf.read_text()):
+                findings.append({
+                    "key":         f"nuclei_{item.get('template_id', '')}",
+                    "title":       item.get("name", "Nuclei Finding"),
+                    "severity":    item.get("severity", "Info"),
+                    "description": item.get("description", ""),
+                    "remediation": [],
+                    "mitre":       "",
+                    "references":  item.get("reference", []),
+                    "evidence":    item.get("snippet", "")[:400],
+                })
+        except Exception:
+            pass
+
+    findings.sort(key=lambda x: _SEVER_ORDER.get(x["severity"], 99))
+    return findings
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODULE: BUG BOUNTY REPORT EXPORT  (Phase 4)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_CVSS_MAP = {
+    "Critical": ("9.0", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"),
+    "High":     ("7.5", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+    "Medium":   ("5.3", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"),
+    "Low":      ("3.1", "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N"),
+    "Info":     ("0.0", "N/A"),
+}
+
+_CWE_MAP = {
+    "ssrf":             ("CWE-918", "Server-Side Request Forgery"),
+    "idor":             ("CWE-639", "Authorization Bypass Through User-Controlled Key"),
+    "open_redirect":    ("CWE-601", "URL Redirection to Untrusted Site"),
+    "subdomain_takeover":("CWE-350","Reliance on Reverse DNS Resolution"),
+    "exposed_secret":   ("CWE-798", "Use of Hard-coded Credentials"),
+    "kerberoast":       ("CWE-522", "Insufficiently Protected Credentials"),
+    "asreproast":       ("CWE-522", "Insufficiently Protected Credentials"),
+    "smb_signing_disabled":("CWE-300","Channel Accessible by Non-Endpoint"),
+    "adcs_vulnerable":  ("CWE-295", "Improper Certificate Validation"),
+    "anon_ldap":        ("CWE-284", "Improper Access Control"),
+    "secrets_dumped":   ("CWE-522", "Insufficiently Protected Credentials"),
+    "MS17-010":         ("CWE-119", "Buffer Overflow"),
+    "CVE-2020-1472":    ("CWE-330", "Use of Insufficiently Random Values"),
+}
+
+
+class BugBountyReport:
+    """Generate submission-ready reports for HackerOne / Bugcrowd / Intigriti.
+
+    Outputs:
+      bb_report/REPORT.md        — full markdown report (one finding per section)
+      bb_report/<key>.md         — individual HackerOne-style submission per finding
+      bb_report/summary.json     — machine-readable summary
+    """
+
+    def __init__(self, target: str, domain: str = "", program: str = ""):
+        self.target  = target
+        self.domain  = domain
+        self.program = program
+        self.date    = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    def _render_finding(self, finding: Dict) -> str:
+        key      = finding["key"]
+        title_s  = finding["title"]
+        sev      = finding["severity"]
+        cvss_s, cvss_v = _CVSS_MAP.get(sev, ("0.0", "N/A"))
+        cwe_id, cwe_name = _CWE_MAP.get(key.split("_")[0], ("", ""))
+
+        # ── Remediation steps ────────────────────────────────────────────────
+        rem_lines = "\n".join(
+            f"{i+1}. {step_}" for i, step_ in enumerate(finding.get("remediation", []))
+        ) or "_No specific remediation steps available._"
+
+        # ── References ───────────────────────────────────────────────────────
+        refs = "\n".join(f"- {r}" for r in finding.get("references", [])) or "_None listed._"
+
+        # ── Evidence ─────────────────────────────────────────────────────────
+        ev = finding.get("evidence", "").strip() or "_No evidence collected._"
+
+        # ── MITRE ────────────────────────────────────────────────────────────
+        mitre = finding.get("mitre", "")
+        mitre_line = f"**MITRE ATT&CK**: [{mitre}](https://attack.mitre.org/techniques/{mitre.replace('.','/')}/)  \n" if mitre else ""
+
+        cwe_line = f"**CWE**: [{cwe_id}](https://cwe.mitre.org/data/definitions/{cwe_id.replace('CWE-','')}.html) — {cwe_name}  \n" if cwe_id else ""
+
+        return f"""# {title_s}
+
+**Severity**: {sev}
+**CVSS Score**: {cvss_s} (`{cvss_v}`)
+{cwe_line}{mitre_line}**Target**: {self.target}
+**Date**: {self.date}
+{f"**Program**: {self.program}  " if self.program else ""}
+
+---
+
+## Summary
+
+{finding.get("description", "_No description available._")}
+
+## Steps to Reproduce
+
+1. Identify the target endpoint / parameter described in the evidence below.
+2. Apply the payload / test case indicated.
+3. Observe the server response confirming the vulnerability.
+
+## Evidence
+
+```
+{ev}
+```
+
+## Impact
+
+This vulnerability allows an attacker to:
+{self._impact_for(key)}
+
+## Remediation
+
+{rem_lines}
+
+## References
+
+{refs}
+"""
+
+    @staticmethod
+    def _impact_for(key: str) -> str:
+        impacts = {
+            "ssrf":              "- Access internal services and cloud metadata (AWS/GCP/Azure IAM credentials)\n- Port scan internal infrastructure\n- Potentially achieve remote code execution via internal services",
+            "idor":              "- Read, modify, or delete other users' private data\n- Escalate privileges by accessing admin objects\n- Mass account enumeration",
+            "open_redirect":     "- Redirect users to phishing pages that appear to originate from a trusted domain\n- Bypass OAuth redirect_uri allowlists\n- Chain with XSS for credential theft",
+            "subdomain_takeover":"- Serve arbitrary content on the victim's subdomain\n- Execute JavaScript in the context of the parent domain (cookie theft)\n- Phishing attacks with full SSL certificate legitimacy",
+            "exposed_secret":    "- Directly authenticate to cloud infrastructure (AWS/GCP/Azure)\n- Access production databases, email, and payment systems\n- Persistent unauthorized access until credentials are rotated",
+            "kerberoast":        "- Offline brute-force of service account passwords\n- Compromise privileged AD accounts to achieve domain admin",
+            "asreproast":        "- Offline brute-force of user account passwords without initial credentials\n- Lateral movement across Active Directory",
+        }
+        return impacts.get(key.split("_")[0], "- Unauthorized access to sensitive resources\n- Potential data exfiltration")
+
+    def export(self, findings: List[Dict]) -> Path:
+        title("Bug Bounty Report Export")
+        out_dir = ensure_dir("bb_report")
+
+        if not findings:
+            warn("No findings to export")
+            return out_dir
+
+        # ── Full unified report ──────────────────────────────────────────────
+        full_md = f"""# Bug Bounty Report — {self.target}
+
+**Date**: {self.date}
+**Domain**: {self.domain or self.target}
+**Findings**: {len(findings)}
+**Critical**: {sum(1 for f in findings if f['severity']=='Critical')}
+**High**: {sum(1 for f in findings if f['severity']=='High')}
+**Medium**: {sum(1 for f in findings if f['severity']=='Medium')}
+**Low**: {sum(1 for f in findings if f['severity']=='Low')}
+
+---
+
+"""
+        sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+        for i, f in enumerate(sorted(findings, key=lambda x: sev_order.get(x["severity"], 99)), 1):
+            full_md += f"## Finding {i}: {f['title']}\n\n"
+            full_md += self._render_finding(f) + "\n---\n\n"
+
+        (out_dir / "REPORT.md").write_text(full_md, encoding="utf-8")
+        success(f"Full report → {out_dir}/REPORT.md")
+
+        # ── Individual submission files ──────────────────────────────────────
+        for f in findings:
+            safe_key = re.sub(r"[^a-z0-9_-]", "_", f["key"].lower())
+            path = out_dir / f"{safe_key}.md"
+            path.write_text(self._render_finding(f), encoding="utf-8")
+
+        # ── JSON summary ────────────────────────────────────────────────────
+        summary = {
+            "target":   self.target,
+            "domain":   self.domain,
+            "program":  self.program,
+            "date":     self.date,
+            "total":    len(findings),
+            "by_severity": {
+                sev: sum(1 for fi in findings if fi["severity"] == sev)
+                for sev in ["Critical", "High", "Medium", "Low", "Info"]
+            },
+            "findings": [
+                {"key": f["key"], "title": f["title"], "severity": f["severity"],
+                 "mitre": f.get("mitre", "")}
+                for f in findings
+            ],
+        }
+        _bb_save("bb_report", "summary.json", summary)
+        success(f"Summary JSON → {out_dir}/summary.json")
+        info(f"Individual submissions → {out_dir}/<finding_key>.md")
+        return out_dir
+
+
+# ── Orchestrator: runs all Bug Bounty phases ──────────────────────────────────
+
+class BugBountyOrchestrator:
+    """Single entry point that runs Phase 1 + Phase 2 + Phase 4 in sequence."""
+
+    def __init__(self, scope: ScopeValidator, rate: float = 0.4,
+                 program: str = ""):
+        self.scope   = scope
+        self.rate    = rate
+        self.program = program
+
+    def run(self, domain: str, base_url: Optional[str] = None) -> Dict:
+        if not self.scope.check(domain):
+            err(f"Domain {domain} is out of scope — aborting")
+            return {}
+
+        url = base_url or f"https://{domain}"
+        results: Dict = {}
+
+        # ── Phase 1: Recon ───────────────────────────────────────────────────
+        recon   = BugBountyRecon(scope=self.scope, rate=self.rate)
+        p1      = recon.run_all(domain, base_url=url)
+        subs    = p1.get("subdomains", [])
+        results["phase1"] = p1
+
+        # Collect discovered URLs from endpoint probe for vuln scanners
+        endpoints: List[Dict] = p1.get("endpoints", [])
+        endpoint_urls = [e["url"] for e in endpoints]
+        all_urls  = [url] + [f"https://{s}" for s in subs[:10]]  # cap subdomains
+
+        # ── Phase 2: Vulns ───────────────────────────────────────────────────
+        ssrf_hits = SSRFScanner(self.scope, self.rate).scan([url] + endpoint_urls[:5])
+        idor_hits = IDORScanner(self.scope, self.rate).scan(url, endpoint_urls[:10])
+        redir_hits = OpenRedirectScanner(self.scope, self.rate).scan([url] + endpoint_urls[:5])
+        take_hits = SubdomainTakeoverScanner(self.scope, self.rate).scan(subs)
+        sec_hits  = ExposedSecretsScanner(self.scope, self.rate).scan(url)
+        nuc_hits  = NucleiWrapper(self.scope).scan(all_urls[:5])
+
+        results["phase2"] = {
+            "ssrf":      ssrf_hits,
+            "idor":      idor_hits,
+            "redirect":  redir_hits,
+            "takeover":  take_hits,
+            "secrets":   sec_hits,
+            "nuclei":    nuc_hits,
+        }
+
+        # ── Phase 4: Report ──────────────────────────────────────────────────
+        all_findings = _collect_findings() + _collect_bb_findings()
+        all_findings.sort(key=lambda x: _SEVER_ORDER.get(x["severity"], 99))
+        reporter = BugBountyReport(
+            target=config.ip or domain,
+            domain=domain,
+            program=self.program,
+        )
+        reporter.export(all_findings)
+        generate_dashboard(all_findings)
+
+        title("Bug Bounty Run Complete")
+        total = len(all_findings)
+        crit  = sum(1 for f in all_findings if f["severity"] == "Critical")
+        high  = sum(1 for f in all_findings if f["severity"] == "High")
+        info(f"Total findings: {total}  (Critical: {crit}  High: {high})")
+        success(f"All output → {OUTPUT_DIR}")
+        results["findings"] = all_findings
+        return results
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # REMEDIATION DATABASE
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1727,6 +2793,118 @@ REMEDIATION_DB: Dict[str, Dict] = {
         "mitre": "T1210",
         "references": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2020-0618"],
     },
+    # ── Web / Bug Bounty findings ─────────────────────────────────────────────
+    "ssrf": {
+        "title": "Server-Side Request Forgery (SSRF)",
+        "severity": "Critical",
+        "description": (
+            "The application fetches remote resources based on user-supplied URLs without "
+            "validating the destination. An attacker can force the server to make requests "
+            "to internal services, cloud metadata endpoints (AWS/GCP/Azure), or localhost, "
+            "potentially exposing IAM credentials or internal APIs."
+        ),
+        "remediation": [
+            "Validate and allowlist URL schemes (https only) and destination domains.",
+            "Block private IP ranges (RFC1918), loopback, and cloud metadata IPs (169.254.169.254) at the application layer.",
+            "Use a dedicated egress proxy with an explicit allowlist instead of direct outbound requests.",
+            "Disable response body reflection — never return raw remote content to the client.",
+            "Apply IMDSv2 with session tokens on AWS EC2 to prevent metadata SSRF.",
+        ],
+        "mitre": "T1090",
+        "references": [
+            "https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/",
+            "https://portswigger.net/web-security/ssrf",
+            "https://cwe.mitre.org/data/definitions/918.html",
+        ],
+    },
+    "idor": {
+        "title": "Insecure Direct Object Reference (IDOR)",
+        "severity": "High",
+        "description": (
+            "Object identifiers (numeric IDs, UUIDs, filenames) are exposed in URLs or "
+            "request parameters without server-side authorization checks. An attacker can "
+            "iterate IDs to access or modify other users' resources."
+        ),
+        "remediation": [
+            "Enforce object-level authorization on every endpoint — check that the authenticated user owns the requested resource.",
+            "Replace sequential integer IDs with non-guessable UUIDs (UUIDv4) to reduce enumeration risk.",
+            "Implement a central authorization middleware rather than per-endpoint checks.",
+            "Log and alert on repeated 403/401 responses from a single IP as an IDOR probing signal.",
+            "Add integration tests that verify cross-user access is rejected for every sensitive endpoint.",
+        ],
+        "mitre": "T1530",
+        "references": [
+            "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/05-Authorization_Testing/04-Testing_for_Insecure_Direct_Object_References",
+            "https://portswigger.net/web-security/access-control/idor",
+            "https://cwe.mitre.org/data/definitions/639.html",
+        ],
+    },
+    "open_redirect": {
+        "title": "Open Redirect",
+        "severity": "Medium",
+        "description": (
+            "One or more redirect parameters accept arbitrary external URLs without validation. "
+            "Attackers can craft links that appear to originate from the trusted domain but "
+            "redirect victims to phishing pages, or chain with OAuth flows to steal tokens."
+        ),
+        "remediation": [
+            "Maintain a server-side allowlist of permitted redirect destinations.",
+            "Reject any redirect target whose hostname does not match your own domain(s).",
+            "If redirects must be dynamic, use an indirect reference (e.g. an integer index into an allowlist) rather than a raw URL.",
+            "Add 'X-Frame-Options: SAMEORIGIN' and a strict Content-Security-Policy to limit chaining.",
+        ],
+        "mitre": "T1598",
+        "references": [
+            "https://owasp.org/www-community/attacks/Unvalidated_Redirects_and_Forwards_Cheat_Sheet",
+            "https://portswigger.net/kb/issues/00500100_open-redirection-reflected",
+            "https://cwe.mitre.org/data/definitions/601.html",
+        ],
+    },
+    "subdomain_takeover": {
+        "title": "Subdomain Takeover",
+        "severity": "High",
+        "description": (
+            "A DNS CNAME record points to a third-party service (GitHub Pages, Heroku, S3, "
+            "Fastly, etc.) that no longer has an associated account or bucket. An attacker "
+            "can claim the service resource and serve arbitrary content—including malicious "
+            "JavaScript—under the victim's domain, fully inheriting its SSL certificate."
+        ),
+        "remediation": [
+            "Audit all CNAME records and remove or update entries that point to unclaimed external services.",
+            "Before decommissioning any cloud resource (S3 bucket, Heroku app, GitHub Pages site), remove its DNS entry first.",
+            "Implement a DNS inventory process: scan for dangling CNAMEs quarterly.",
+            "Use a CNAME monitoring service or integrate subdomain takeover detection into CI/CD.",
+        ],
+        "mitre": "T1584",
+        "references": [
+            "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/10-Test_for_Subdomain_Takeover",
+            "https://github.com/EdOverflow/can-i-take-over-xyz",
+            "https://cwe.mitre.org/data/definitions/350.html",
+        ],
+    },
+    "exposed_secret": {
+        "title": "Exposed Credentials / API Keys",
+        "severity": "Critical",
+        "description": (
+            "Hardcoded API keys, tokens, or passwords were found in publicly accessible "
+            "JavaScript files, configuration endpoints, or source code. These credentials "
+            "provide direct unauthorized access to third-party services (AWS, Stripe, GitHub, etc.)."
+        ),
+        "remediation": [
+            "Rotate ALL exposed credentials immediately — treat them as fully compromised.",
+            "Move secrets to environment variables or a secrets manager (AWS Secrets Manager, HashiCorp Vault, Doppler).",
+            "Add pre-commit hooks (git-secrets, gitleaks, trufflehog) to prevent future commits of secrets.",
+            "Audit git history for historical secret exposure: `trufflehog git <repo_url>`.",
+            "Implement least-privilege API keys with IP allowlists and short expiry where the service supports it.",
+            "Enable SAST rules in CI/CD pipeline to catch secrets before they reach production.",
+        ],
+        "mitre": "T1552",
+        "references": [
+            "https://owasp.org/www-community/vulnerabilities/Use_of_hard-coded_password",
+            "https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html",
+            "https://cwe.mitre.org/data/definitions/798.html",
+        ],
+    },
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1801,6 +2979,9 @@ def _collect_findings() -> List[Dict]:
                 _add(r["cve"], r.get("details", "")[:200])
         except Exception:
             pass
+
+    # ── Bug Bounty Phase 2 findings ───────────────────────────────────────────
+    findings.extend(_collect_bb_findings())
 
     findings.sort(key=lambda x: _SEVER_ORDER.get(x["severity"], 99))
     return findings
@@ -2992,18 +4173,34 @@ Examples:
     # Recommendation 3: dry-run
     p.add_argument("--dry-run",       action="store_true",
                    help="Print commands without executing them")
-    # ── Bug Bounty Phase 1 ────────────────────────────────────────────────────
+    # ── Bug Bounty Phase 1 (Recon) ────────────────────────────────────────────
     bb = p.add_argument_group("Bug Bounty Recon (Phase 1)")
     bb.add_argument("--bb-recon",     action="store_true",
-                    help="Run Phase 1 bug-bounty recon: subdomains, endpoints, tech fingerprint")
+                    help="Run Phase 1 only: subdomains, endpoints, tech fingerprint")
     bb.add_argument("--bb-scope",     metavar="FILE",
-                    help="Scope file (JSON or plain text) — required for --bb-recon")
+                    help="Scope file (JSON or plain text) — enforced for all bb-* flags")
     bb.add_argument("--bb-domain",    metavar="DOMAIN",
                     help="Root domain for subdomain enumeration (overrides -d)")
     bb.add_argument("--bb-url",       metavar="URL",
                     help="Base URL for endpoint probing (default: https://<domain>)")
-    bb.add_argument("--bb-rate",      type=float, default=0.5, metavar="SECS",
-                    help="Delay between HTTP requests during recon (default: 0.5)")
+    bb.add_argument("--bb-rate",      type=float, default=0.4, metavar="SECS",
+                    help="Delay between HTTP requests (default: 0.4)")
+    # ── Bug Bounty Phase 2 (Vulns) + Phase 4 (Report) ────────────────────────
+    bb2 = p.add_argument_group("Bug Bounty Vulns (Phase 2) + Report (Phase 4)")
+    bb2.add_argument("--bb-vuln",     action="store_true",
+                     help="Run all Phase 2 vuln scanners (SSRF, IDOR, redirect, takeover, secrets, Nuclei)")
+    bb2.add_argument("--bb-ssrf",     action="store_true", help="SSRF scanner only")
+    bb2.add_argument("--bb-idor",     action="store_true", help="IDOR scanner only")
+    bb2.add_argument("--bb-redirect", action="store_true", help="Open redirect scanner only")
+    bb2.add_argument("--bb-takeover", action="store_true", help="Subdomain takeover scanner only")
+    bb2.add_argument("--bb-secrets",  action="store_true", help="Exposed secrets scanner only")
+    bb2.add_argument("--bb-nuclei",   action="store_true", help="Nuclei scanner only")
+    bb2.add_argument("--bb-full",     action="store_true",
+                     help="Run ALL bug bounty phases (1 + 2 + 4): full recon → vulns → report")
+    bb2.add_argument("--bb-program",  metavar="NAME", default="",
+                     help="Bug bounty program name for report attribution")
+    bb2.add_argument("--bb-report",   action="store_true",
+                     help="Export Phase 4 HackerOne/Bugcrowd submission reports from existing findings")
     return p.parse_args()
 
 
@@ -3095,21 +4292,90 @@ def main():
          ("target","domain","username","password","hash","output","interface"))]
     )
 
-    # ── Bug Bounty Phase 1 ────────────────────────────────────────────────────
-    if args.bb_recon:
+    # ── Bug Bounty: shared scope + domain setup ───────────────────────────────
+    _bb_any = any([
+        args.bb_recon, args.bb_vuln, args.bb_full, args.bb_ssrf, args.bb_idor,
+        args.bb_redirect, args.bb_takeover, args.bb_secrets, args.bb_nuclei,
+        args.bb_report,
+    ])
+    if _bb_any:
         scope_file = Path(args.bb_scope) if args.bb_scope else None
         if scope_file and not scope_file.exists():
             err(f"Scope file not found: {scope_file}")
             sys.exit(ExitCode.CONFIG_ERROR)
-        scope = ScopeValidator(scope_file)
-        bb_domain = args.bb_domain or config.domain or config.ip
-        if not bb_domain:
+        _bb_scope   = ScopeValidator(scope_file)
+        _bb_domain  = args.bb_domain or config.domain or config.ip or ""
+        _bb_url     = args.bb_url or (f"https://{_bb_domain}" if _bb_domain else "")
+        _bb_rate    = args.bb_rate
+        if _bb_domain:
+            _bb_scope.add_target(_bb_domain)
+
+    # ── --bb-full: all phases in one shot ─────────────────────────────────────
+    if args.bb_full:
+        if not _bb_domain:
+            err("--bb-full requires --bb-domain or -d <domain>")
+            sys.exit(ExitCode.CONFIG_ERROR)
+        BugBountyOrchestrator(
+            scope=_bb_scope, rate=_bb_rate, program=args.bb_program
+        ).run(_bb_domain, base_url=_bb_url)
+        sys.exit(ExitCode.SUCCESS)
+
+    # ── --bb-recon: Phase 1 only ──────────────────────────────────────────────
+    if args.bb_recon:
+        if not _bb_domain:
             err("--bb-recon requires --bb-domain or -d <domain>")
             sys.exit(ExitCode.CONFIG_ERROR)
-        scope.add_target(bb_domain)
-        recon = BugBountyRecon(scope=scope, rate=args.bb_rate)
-        recon.run_all(bb_domain, base_url=args.bb_url)
+        BugBountyRecon(scope=_bb_scope, rate=_bb_rate).run_all(_bb_domain, base_url=_bb_url)
         generate_report()
+        success(f"Done — results in {OUTPUT_DIR}")
+        sys.exit(ExitCode.SUCCESS)
+
+    # ── --bb-vuln / individual vuln flags: Phase 2 ───────────────────────────
+    if args.bb_vuln or args.bb_ssrf or args.bb_idor or args.bb_redirect \
+            or args.bb_takeover or args.bb_secrets or args.bb_nuclei:
+        if not _bb_url:
+            err("Phase 2 requires --bb-url or --bb-domain")
+            sys.exit(ExitCode.CONFIG_ERROR)
+
+        # Load subdomains from Phase 1 output if available
+        _sub_file = OUTPUT_DIR / "bb_recon" / "subdomains.txt"
+        _subs = _sub_file.read_text().splitlines() if _sub_file.exists() else []
+
+        if args.bb_vuln or args.bb_ssrf:
+            SSRFScanner(_bb_scope, _bb_rate).scan([_bb_url])
+        if args.bb_vuln or args.bb_idor:
+            IDORScanner(_bb_scope, _bb_rate).scan(_bb_url)
+        if args.bb_vuln or args.bb_redirect:
+            OpenRedirectScanner(_bb_scope, _bb_rate).scan([_bb_url])
+        if args.bb_vuln or args.bb_takeover:
+            SubdomainTakeoverScanner(_bb_scope, _bb_rate).scan(_subs)
+        if args.bb_vuln or args.bb_secrets:
+            ExposedSecretsScanner(_bb_scope, _bb_rate).scan(_bb_url)
+        if args.bb_vuln or args.bb_nuclei:
+            NucleiWrapper(_bb_scope).scan([_bb_url])
+
+        if args.bb_report or args.bb_vuln:
+            all_findings = _collect_findings()
+            BugBountyReport(
+                target=config.ip or _bb_domain,
+                domain=_bb_domain,
+                program=args.bb_program,
+            ).export(all_findings)
+            generate_dashboard(all_findings)
+
+        generate_report()
+        success(f"Done — results in {OUTPUT_DIR}")
+        sys.exit(ExitCode.SUCCESS)
+
+    # ── --bb-report: Phase 4 standalone export from existing findings ─────────
+    if args.bb_report:
+        all_findings = _collect_findings()
+        BugBountyReport(
+            target=config.ip or _bb_domain,
+            domain=_bb_domain,
+            program=args.bb_program,
+        ).export(all_findings)
+        generate_dashboard(all_findings)
         success(f"Done — results in {OUTPUT_DIR}")
         sys.exit(ExitCode.SUCCESS)
 
