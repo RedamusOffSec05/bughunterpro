@@ -631,6 +631,7 @@ class BugHunterPro:
         )
 
     def hunt(self):
+        print(f"[+] Hunting en {self.target}")
         banner()
         info(f"Target: {M.PALE}{self.target}{M.RST}  Mode: {M.GOLD}{self.mode}")
         if self.usb_host:
@@ -679,7 +680,7 @@ class BugHunterPro:
             warn(f"Critical   : {s['critical']} — prioritise immediately")
 
         return {
-            "subdomains":      {sd["host"] for sd in subdomains},
+            "subdomains":      sorted({sd["host"] for sd in subdomains}),
             "vulnerabilities": vulns,
             "usb":             usb_results,
             "report":          report,
@@ -692,7 +693,6 @@ def _add_common(p):
     p.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     p.add_argument("--config",  "-c", default=None, metavar="FILE",
                    help="YAML/JSON config file (auto-detects bhp.yaml if present)")
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -736,7 +736,12 @@ def main():
     creds_p.add_argument("--rate", type=float, default=2.0,
                          help="Max attempts per second (default: 2.0)")
 
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    commands = {"scan", "recon", "creds"}
+    if argv and argv[0] not in commands and argv[0] not in {"-h", "--help"}:
+        args = parser.parse_args(["scan", *argv])
+    else:
+        args = parser.parse_args()
 
     # Load config file
     cfg = {}
